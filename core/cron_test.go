@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1289,4 +1290,75 @@ func mustParseStandardForTest(t *testing.T, expr string) cron.Schedule {
 		t.Fatalf("cron.ParseStandard(%q) failed: %v", expr, err)
 	}
 	return s
+}
+
+// TestCronStore_GetReturnsSnapshot pins the bug where CronStore.Get
+// returned the stored *CronJob, so callers read mutable fields without
+// holding s.mu while concurrent writers rewrote the same fields.
+func TestCronStore_GetReturnsSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewCronStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	job := &CronJob{
+		ID:         "race-target",
+		Project:    "proj",
+		SessionKey: "test:ch1",
+		CronExpr:   "0 6 * * *",
+		Prompt:     "initial",
+		Enabled:    true,
+		CreatedAt:  time.Now(),
+	}
+	if err := store.Add(job); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	snap := store.Get("race-target")
+	if snap == nil {
+		t.Fatal("Get returned nil for stored job")
+	}
+	snap.Prompt = "mutated by caller"
+	if got := store.Get("race-target").Prompt; got != "initial" {
+		t.Fatalf("caller mutation leaked into store: Prompt = %q, want %q", got, "initial")
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				value := "writer-" + strings.Repeat("x", w%3+1)
+				store.Update("race-target", "prompt", value)
+				store.MarkRun("race-target", nil)
+			}
+		}(w)
+	}
+	for r := 0; r < 8; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				j := store.Get("race-target")
+				if j == nil {
+					continue
+				}
+				_ = j.Prompt
+				_ = j.SessionKey
+				_ = j.Enabled
+				_ = j.LastError
+				_ = j.LastRun
+			}
+		}()
+	}
+	wg.Wait()
+	close(stop)
 }
