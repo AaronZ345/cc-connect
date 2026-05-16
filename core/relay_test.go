@@ -484,6 +484,41 @@ func TestHandleRelay_TimeoutExcludesToolResults(t *testing.T) {
 	}
 }
 
+func TestHandleRelay_UnblocksWhenAgentGoesSilent(t *testing.T) {
+	e := newTestEngine()
+	session := newControllableSession("relay-session")
+	e.agent = &controllableAgent{nextSession: session}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	type relayResult struct {
+		resp string
+		err  error
+	}
+	done := make(chan relayResult, 1)
+	go func() {
+		resp, err := e.HandleRelay(ctx, "source", "test:chat-1:user", "hello")
+		done <- relayResult{resp: resp, err: err}
+	}()
+	session.events <- Event{Type: EventText, Content: "partial response"}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("HandleRelay() error = %v, want nil", got.err)
+		}
+		if !strings.Contains(got.resp, "partial response") {
+			t.Fatalf("HandleRelay() response = %q, want partial text", got.resp)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleRelay did not return after relay timeout while agent was silent")
+	}
+	session.events <- Event{Type: EventResult, Content: "done"}
+	select {
+	case <-session.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background drain goroutine did not close the session")
+	}
+}
+
 func TestHandleRelay_TimeoutWithoutTextReturnsContextError(t *testing.T) {
 	e := newTestEngine()
 	session := newControllableSession("relay-session")
