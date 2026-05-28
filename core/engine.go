@@ -15800,7 +15800,9 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 		case event, ok = <-events:
 			if !ok {
 				// Event channel closed without EventResult.
-				agentSession.Close()
+				if err := agentSession.Close(); err != nil {
+					slog.Debug("relay: close session after event channel closed failed", "error", err)
+				}
 				if ctx.Err() != nil {
 					return relayPartialResponseOrError(ctx.Err(), textParts, fromProject, e.name)
 				}
