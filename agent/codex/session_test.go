@@ -739,11 +739,24 @@ func writeFakeCodexScript(t *testing.T, dir, shellScript, powershellScript strin
 func waitForArgsFile(t *testing.T, path string) []string {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
+	var lastText string
+	stableReads := 0
 	for time.Now().Before(deadline) {
 		data, err := os.ReadFile(path)
 		if err == nil {
 			text := strings.TrimSpace(string(data))
 			if text != "" {
+				if text != lastText {
+					lastText = text
+					stableReads = 0
+					time.Sleep(20 * time.Millisecond)
+					continue
+				}
+				stableReads++
+				if stableReads < 2 {
+					time.Sleep(20 * time.Millisecond)
+					continue
+				}
 				lines := strings.Split(text, "\n")
 				args := make([]string, 0, len(lines))
 				for _, line := range lines {
