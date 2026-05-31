@@ -753,6 +753,7 @@ func waitForArgsFile(t *testing.T, path string) []string {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	var last string
+	stableReads := 0
 	for time.Now().Before(deadline) {
 		data, err := os.ReadFile(path)
 		if err == nil {
@@ -760,6 +761,12 @@ func waitForArgsFile(t *testing.T, path string) []string {
 			if text != "" {
 				if text != last {
 					last = text
+					stableReads = 0
+					time.Sleep(20 * time.Millisecond)
+					continue
+				}
+				stableReads++
+				if stableReads < 2 {
 					time.Sleep(20 * time.Millisecond)
 					continue
 				}
