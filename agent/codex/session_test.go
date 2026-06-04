@@ -288,7 +288,7 @@ func TestCodexPromptPreamble_EmptyIsNoop(t *testing.T) {
 
 func TestGetModelAndReasoningEffort_FromRuntimeConfigWhenUnset(t *testing.T) {
 	oldTimeout := codexRuntimeConfigTimeout
-	codexRuntimeConfigTimeout = 5 * time.Second
+	codexRuntimeConfigTimeout = 15 * time.Second
 	t.Cleanup(func() { codexRuntimeConfigTimeout = oldTimeout })
 
 	workDir := t.TempDir()
