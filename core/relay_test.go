@@ -420,7 +420,7 @@ func TestHandleRelay_UnblocksWhenAgentGoesSilent(t *testing.T) {
 	}
 	done := make(chan relayResult, 1)
 	go func() {
-		resp, err := e.HandleRelay(ctx, "source", "chat-1", "hello")
+		resp, err := e.HandleRelay(ctx, "source", "test:chat-1:user", "hello")
 		done <- relayResult{resp: resp, err: err}
 	}()
 
