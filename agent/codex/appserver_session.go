@@ -253,7 +253,6 @@ func (s *appServerSession) connect() error {
 	}
 	cmd := exec.CommandContext(s.ctx, "codex", args...)
 	cmd.Dir = s.workDir
-	prepareCmdForKill(cmd)
 	env := append([]string(nil), s.extraEnv...)
 	if s.codexHome != "" {
 		env = append(env, "CODEX_HOME="+s.codexHome)
@@ -948,10 +947,7 @@ func (s *appServerSession) Close() error {
 		s.stdin = nil
 	}
 	if s.cmd != nil && s.cmd.Process != nil {
-		if err := forceKillCmd(s.cmd); err != nil {
-			slog.Debug("codex app-server: force kill failed", "error", err)
-		}
-		s.cmd = nil
+		_ = s.cmd.Process.Kill()
 	}
 	s.procMu.Unlock()
 
