@@ -82,6 +82,9 @@ the full themed summary; per-beta details remain in the beta sections below.
 - **history**: make entry truncation configurable via `[display].history_max_len`
   (default 1000, `0` disables truncation) and raise the default from 200 to 1000
   (#1291)
+- **core**: queued messages are no longer dropped as stale merely because a later
+  queued message has a higher `create_time`; drain loops now compare only against
+  completed and in-flight turns (#1286)
 - **tts/minimax**: drop `status=2` trailer chunk to stop audio playing twice (#1364)
 - **tests**: add provider-resume regression tests for codex / opencode / kimi (#1366)
 
