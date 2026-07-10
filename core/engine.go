@@ -9728,7 +9728,7 @@ func (e *Engine) cmdReasoning(p Platform, msg *Message, args []string) {
 				buttons = append(buttons, row)
 			}
 			sb.WriteString("\n")
-			sb.WriteString(e.i18n.T(MsgReasoningUsage))
+			sb.WriteString(e.reasoningUsage(efforts))
 			e.replyWithButtons(p, msg.ReplyCtx, sb.String(), buttons)
 			return
 		}
@@ -9750,7 +9750,7 @@ func (e *Engine) cmdReasoning(p Platform, msg *Message, args []string) {
 		}
 	}
 	if !valid {
-		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgReasoningUsage))
+		e.reply(p, msg.ReplyCtx, e.reasoningUsage(efforts))
 		return
 	}
 
@@ -9763,6 +9763,10 @@ func (e *Engine) cmdReasoning(p Platform, msg *Message, args []string) {
 	sessions.Save()
 
 	e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgReasoningChanged, target))
+}
+
+func (e *Engine) reasoningUsage(efforts []string) string {
+	return e.i18n.Tf(MsgReasoningUsage, strings.Join(efforts, "|"))
 }
 
 func (e *Engine) cmdMode(p Platform, msg *Message, args []string) {
@@ -12877,7 +12881,7 @@ func (e *Engine) renderReasoningCard() *Card {
 		Markdown(sb.String()).
 		Select(e.i18n.T(MsgReasoningSelectPlaceholder), opts, initVal).
 		Buttons(e.cardBackButton())
-	cb.Note(e.i18n.T(MsgReasoningUsage))
+	cb.Note(e.reasoningUsage(efforts))
 	return cb.Build()
 }
 
