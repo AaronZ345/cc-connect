@@ -197,6 +197,29 @@ type Platform struct {
 	imageBatchMu     sync.Mutex
 	imageBatch       map[string]*imageBatchEntry
 	imageBatchWindow time.Duration // quiet period before flushing a batch; 0 means use defaultImageBatchWindow
+
+	// resourceDownloadHTTP is the bare HTTP client used to download message
+	// resources directly from Feishu with HTTP Range requests. The larkim SDK's
+	// GetMessageResource does not expose a Range header (#1741), so for files
+	// larger than ~2MB the SDK issues a plain GET and Feishu rejects the
+	// response with code=234037. Bypassing the SDK with our own client and
+	// Range header is the supported workaround.
+	resourceDownloadHTTP *http.Client
+	// resourceChunkSize is the byte size of each Range request issued during
+	// chunked downloads. 8 MiB matches Feishu's documented guidance and keeps
+	// memory bounded. Operators can override via resource_chunk_size_bytes in
+	// config; values are clamped to [1 MiB, 64 MiB].
+	resourceChunkSize int64
+	// resourceMaxBytes caps the total bytes a single resource download may
+	// consume, guarding against adversarial servers that report an
+	// unboundedly large Content-Length. 512 MiB matches cc-connect's own
+	// inbound attachment cap and is large enough for any plausible bot user
+	// attachment on Feishu/Lark today.
+	resourceMaxBytes int64
+	// fetchResourceToken returns the bearer token used for resource downloads.
+	// When nil, defaults to fetchFreshTenantAccessToken. Indirected so unit
+	// tests can inject a stub without spinning up the full lark SDK.
+	fetchResourceToken func(ctx context.Context) (string, error)
 }
 
 // defaultImageBatchWindow is the quiet period after the last image in a
@@ -207,6 +230,17 @@ type Platform struct {
 // image sends. Operators that need a longer or shorter window can override
 // it via the platform option `image_batch_window_ms`.
 const defaultImageBatchWindow = 500 * time.Millisecond
+
+// defaultResourceMaxBytes caps the total bytes a single Feishu resource
+// download may consume. Feishu's message-resource endpoint does not validate
+// caller-side size limits beyond the per-app upload cap (typically 1 GiB for
+// files; 60 MiB for images), and a misconfigured server can advertise a
+// Content-Length orders of magnitude larger than the actual resource. 512 MiB
+// matches the inbound attachment cap cc-connect applies everywhere else and is
+// large enough to cover any realistic bot user attachment on Feishu/Lark.
+// Operators that need to download larger files can raise this via
+// resource_max_bytes; the value is clamped to a sane minimum of 1 MiB.
+const defaultResourceMaxBytes int64 = 512 * 1024 * 1024
 
 // batchWindow returns the effective image-batch coalesce window for this
 // Platform. Tests and zero-initialised Platforms fall back to the default so
@@ -382,6 +416,27 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		imageBatchWindow = time.Duration(ms) * time.Millisecond
 	}
 
+	// resource_chunk_size_bytes: byte size for each Range request when chunked-
+	// downloading Feishu message resources (issue #1741). The larkim SDK does
+	// not expose Range headers, so for resources above ~2 MiB a plain GET
+	// returns code=234037. Default 8 MiB; clamped to [1 MiB, 64 MiB].
+	resourceChunkSize := int64(8 * 1024 * 1024)
+	if raw, ok := opts["resource_chunk_size_bytes"]; ok {
+		n, err := coerceMilliseconds(raw)
+		if err != nil {
+			return nil, fmt.Errorf("%s: invalid resource_chunk_size_bytes %v: %w", name, raw, err)
+		}
+		if n > 0 {
+			resourceChunkSize = n
+		}
+	}
+	if resourceChunkSize < 1*1024*1024 {
+		resourceChunkSize = 1 * 1024 * 1024
+	}
+	if resourceChunkSize > 64*1024*1024 {
+		resourceChunkSize = 64 * 1024 * 1024
+	}
+
 	// Webhook mode configuration (for Lark international version)
 	port, _ := opts["port"].(string)
 	if port == "" {
@@ -426,6 +481,9 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		mentionMap:                 mentionMap,
 		imageBatch:                 make(map[string]*imageBatchEntry),
 		imageBatchWindow:           imageBatchWindow,
+		resourceDownloadHTTP:       &http.Client{Timeout: 60 * time.Second},
+		resourceChunkSize:          resourceChunkSize,
+		resourceMaxBytes:           defaultResourceMaxBytes,
 	}
 	if !useInteractiveCard {
 		base.self = base
@@ -3065,24 +3123,14 @@ func buildFeishuFileMessageContent(msgType, fileKey string) (string, error) {
 }
 
 func (p *Platform) downloadImage(messageID, imageKey string) ([]byte, string, error) {
-	resp, err := p.client.Im.MessageResource.Get(context.Background(),
-		larkim.NewGetMessageResourceReqBuilder().
-			MessageId(messageID).
-			FileKey(imageKey).
-			Type("image").
-			Build())
+	// Issue #1741: large image bodies suffer the same code=234037 truncation
+	// as files when fetched through the larkim SDK (which cannot set Range
+	// headers). Route image downloads through the same chunked helper used
+	// for files so a 20-MiB screenshot lands whole instead of being capped
+	// at the SDK's ~2 MiB streaming ceiling.
+	data, err := p.downloadResourceChunked(context.Background(), messageID, imageKey, "image")
 	if err != nil {
-		return nil, "", fmt.Errorf("%s: image API: %w", p.tag(), err)
-	}
-	if !resp.Success() {
-		return nil, "", fmt.Errorf("%s: image API code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
-	}
-	if resp.File == nil {
-		return nil, "", fmt.Errorf("%s: image API returned nil file body", p.tag())
-	}
-	data, err := io.ReadAll(resp.File)
-	if err != nil {
-		return nil, "", fmt.Errorf("%s: read image: %w", p.tag(), err)
+		return nil, "", fmt.Errorf("%s: image download: %w", p.tag(), err)
 	}
 
 	mimeType := detectMimeType(data)
@@ -3091,24 +3139,14 @@ func (p *Platform) downloadImage(messageID, imageKey string) ([]byte, string, er
 }
 
 func (p *Platform) downloadResource(messageID, fileKey, resType string) ([]byte, error) {
-	resp, err := p.client.Im.MessageResource.Get(context.Background(),
-		larkim.NewGetMessageResourceReqBuilder().
-			MessageId(messageID).
-			FileKey(fileKey).
-			Type(resType).
-			Build())
+	// Issue #1741: the larkim SDK issues a plain GET that Feishu truncates
+	// with code=234037 for resources above ~2 MiB. downloadResourceChunked
+	// bypasses the SDK, sends Range headers, and reassembles the bytes
+	// client-side. All four existing call sites (audio body, file body,
+	// merge_forward file, #1588 quoted file) flow through here unchanged.
+	data, err := p.downloadResourceChunked(context.Background(), messageID, fileKey, resType)
 	if err != nil {
-		return nil, fmt.Errorf("%s: resource API: %w", p.tag(), err)
-	}
-	if !resp.Success() {
-		return nil, fmt.Errorf("%s: resource API code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
-	}
-	if resp.File == nil {
-		return nil, fmt.Errorf("%s: resource API returned nil file body", p.tag())
-	}
-	data, err := io.ReadAll(resp.File)
-	if err != nil {
-		return nil, fmt.Errorf("%s: read resource: %w", p.tag(), err)
+		return nil, err
 	}
 	slog.Debug(p.tag()+": downloaded resource", "key", fileKey, "type", resType, "size", len(data))
 	return data, nil
@@ -3815,8 +3853,10 @@ func isTenantAccessTokenInvalid(err error) bool {
 	return strings.Contains(msg, "99991663") || strings.Contains(msg, "invalid access token")
 }
 
-// Transient retry constants for network-level failures.
-const (
+// Transient retry settings for network-level failures. Declared as var (not
+// const) so tests can shrink the retry window; production callers never
+// touch them after init.
+var (
 	maxTransientRetries    = 3
 	transientRetryInitial  = 500 * time.Millisecond
 	transientRetryMaxDelay = 5 * time.Second
