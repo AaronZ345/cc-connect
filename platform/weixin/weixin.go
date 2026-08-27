@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -44,6 +45,42 @@ const (
 	// typingRepeatInterval is how often to resend the typing status to keep it alive.
 	typingRepeatInterval = 5 * time.Second
 )
+
+// sendPath labels the call site that reaches the outbound API so the burst
+// budget can be scoped to where ilink actually throttles us (issue #1742).
+//   - sendPathReply: reactive reply to an inbound user message. The gateway
+//     does not throttle replies on interactive deployments, so the push-path
+//     budget must NOT consume them.
+//   - sendPathPush: proactive push (cron / timer / file transfer / SendImage /
+//     SendFile / SendAudio). Counts against burst_limit.
+//
+// File transfers count as push because they share the same outbound
+// sendMessage endpoint and are exactly the kind of "separate-message" traffic
+// that the gateway throttles.
+type sendPath string
+
+const (
+	sendPathReply sendPath = "reply"
+	sendPathPush  sendPath = "push"
+)
+
+// pushBudgetExceededCounter is incremented every time the push-path burst
+// budget is exhausted. Exposed via PushBudgetExceededTotal() for diagnostics
+// (`cc-connect doctor` and on-demand queries). Per-process — the budget itself
+// is per-account, but the counter is only observability and reset on restart.
+var pushBudgetExceededCounter atomic.Int64
+
+// PushBudgetExceededTotal returns how many times the push-path burst budget
+// has blocked a send since process start. Replies are not counted because they
+// bypass the quota entirely.
+func PushBudgetExceededTotal() int64 {
+	return pushBudgetExceededCounter.Load()
+}
+
+// resetPushBudgetExceededCounter is for tests only.
+func resetPushBudgetExceededCounter() {
+	pushBudgetExceededCounter.Store(0)
+}
 
 type replyContext struct {
 	peerUserID   string
@@ -595,12 +632,20 @@ func randomHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
+// Reply sends a reactive text reply to an inbound user message. Replies bypass
+// the push-path burst budget (issue #1742): the gateway does not throttle
+// replies on interactive deployments, and counting them against the push
+// budget silently bricked weixin bots at 4 replies per 24h after the v1.5.0
+// default landed.
 func (p *Platform) Reply(ctx context.Context, replyCtx any, content string) error {
-	return p.sendChunks(ctx, replyCtx, content)
+	return p.sendChunks(ctx, replyCtx, content, sendPathReply)
 }
 
+// Send proactively pushes a message to the user (cron / timer / Relay). Pushes
+// count against the burst budget because ilink DOES throttle proactive sends
+// (see #1643 / #1742).
 func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error {
-	return p.sendChunks(ctx, replyCtx, content)
+	return p.sendChunks(ctx, replyCtx, content, sendPathPush)
 }
 
 // StartTyping sends a typing indicator to the peer and repeats every few seconds
@@ -709,7 +754,22 @@ func (p *Platform) refreshTypingTicket(ctx context.Context, peerID, contextToken
 // fail-fast philosophy (see sendChunk) applies: do not keep hammering a
 // throttled bot. Configure via burst_limit / burst_window_secs platform
 // options. A limit of 0 disables the quota.
-func (p *Platform) checkSendQuota(ctx context.Context) error {
+//
+// The quota is intentionally scoped to the PUSH path (proactive cron/timer and
+// outbound media). The REPLY path bypasses it entirely: the gateway does not
+// throttle replies on interactive deployments, and counting them against the
+// push budget silently bricked weixin bots at 4 replies per 24h after the
+// v1.5.0 default landed (issue #1742). File transfers count as push because
+// they hit the same outbound API. See sendPath values below.
+func (p *Platform) checkSendQuota(ctx context.Context, path sendPath) error {
+	if path == sendPathReply {
+		// Replies are never throttled by ilink in practice; applying the
+		// push-path budget to replies would block interactive conversations
+		// the moment the proactive-push budget is exhausted. The fixed-cost
+		// window-bucket logic is also wrong for replies: a user can easily
+		// exchange >4 messages in a day on a busy chat. Issue #1742.
+		return nil
+	}
 	if p.sendQuotaLimit <= 0 || p.sendQuotaWindow <= 0 {
 		return nil
 	}
@@ -725,20 +785,28 @@ func (p *Platform) checkSendQuota(ctx context.Context) error {
 	p.sendQuotaTimes = kept
 	if len(p.sendQuotaTimes) >= p.sendQuotaLimit {
 		p.sendQuotaMu.Unlock()
-		return fmt.Errorf("weixin: send budget exhausted (%d messages in the last %s); "+
-			"ilink throttles the bot after roughly 5-6 sends per window — reduce messages or re-login later", p.sendQuotaLimit, p.sendQuotaWindow)
+		pushBudgetExceededCounter.Add(1)
+		slog.Error("weixin: push_path_budget_exceeded",
+			"path", string(path),
+			"used", len(p.sendQuotaTimes),
+			"limit", p.sendQuotaLimit,
+			"window", p.sendQuotaWindow.String(),
+			"hint", "ilink throttles the bot after roughly 5-6 pushes per window — reduce cron/timer pushes or re-login later",
+		)
+		return fmt.Errorf("weixin: push budget exhausted (%d push messages in the last %s); "+
+			"ilink throttles the bot after roughly 5-6 pushes per window — reduce messages or re-login later", p.sendQuotaLimit, p.sendQuotaWindow)
 	}
 	p.sendQuotaTimes = append(p.sendQuotaTimes, now)
 	p.sendQuotaMu.Unlock()
 	return nil
 }
 
-func (p *Platform) sendChunks(ctx context.Context, replyCtx any, content string) error {
+func (p *Platform) sendChunks(ctx context.Context, replyCtx any, content string, path sendPath) error {
 	rc, ok := replyCtx.(*replyContext)
 	if !ok || rc == nil {
 		return fmt.Errorf("weixin: invalid reply context")
 	}
-	if err := p.checkSendQuota(ctx); err != nil {
+	if err := p.checkSendQuota(ctx, path); err != nil {
 		return err
 	}
 	if strings.TrimSpace(rc.contextToken) == "" {
