@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.5.1-beta.1 (2026-08-28)
+
+Beta since v1.5.0 stable — 16 merged PRs focused on Feishu/Weixin reliability, Claude Code /compact, Codex reasoning, and Cursor image attachments. See `changelogs/v1.5.1-beta.1.md` for the full contributor list.
+
+### New Features
+- **i18n**: Localize agent system prompts (cron/timer/send/relay) based on language config (#1721, #1655)
+- **Cursor**: Deliver image attachments via on-disk paths (#1709)
+
+### Fixed
+- **Feishu**: Chunked HTTP Range download for large resources (#1746); fail-closed on bot open_id discovery (#1725)
+- **Weixin**: Split send budget by reply vs push path (#1743); configurable inbound dedup (#1733)
+- **Claude Code**: Restore /compact and slash commands (#1737); bounded session teardown (#1714)
+- **Codex**: Propagate failed turns (#1730); max reasoning effort (#1727); /list session names (#1639)
+- **Pi**: Attachment @path refs (#1724); Windows build fix (#1738)
+- **Session**: /switch target idle reset exemption (#1734)
+- **Daemon/Skills**: Non-Linux build (#1710); plugin skill roots (#1713)
+
 ## Unreleased
 
 ### Added
