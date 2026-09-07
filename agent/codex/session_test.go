@@ -296,10 +296,6 @@ func TestCodexPromptPreamble_EmptyIsNoop(t *testing.T) {
 }
 
 func TestGetModelAndReasoningEffort_FromRuntimeConfigWhenUnset(t *testing.T) {
-	oldTimeout := codexRuntimeConfigTimeout
-	codexRuntimeConfigTimeout = 15 * time.Second
-	t.Cleanup(func() { codexRuntimeConfigTimeout = oldTimeout })
-
 	workDir := t.TempDir()
 	binDir := filepath.Join(workDir, "bin")
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
