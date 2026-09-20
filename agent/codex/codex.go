@@ -616,16 +616,13 @@ func codexSkillDirs(workDir, explicitCodexHome string) []string {
 	if codexHome != "" {
 		userDirs = append(userDirs,
 			filepath.Join(codexHome, "skills"),
-			// Superpowers installs Codex-compatible skills under this layout.
-			filepath.Join(codexHome, "superpowers", "skills"),
+			filepath.Join(codexHome, "skills", ".system"),
 		)
 		userDirs = append(userDirs, skillroots.Find(filepath.Join(codexHome, "plugins"))...)
 	}
 	if homeDir != "" {
 		userDirs = append(userDirs,
 			filepath.Join(homeDir, ".agents", "skills"),
-			// Codex deliberately shares Claude-format SKILL.md directories.
-			filepath.Join(homeDir, ".claude", "skills"),
 		)
 	}
 	return uniqueCodexSkillDirs(append(projectDirs, userDirs...))
@@ -644,8 +641,6 @@ func walkUpCodexProjectSkillDirs(workDir, homeDir string) []string {
 		dirs = append(dirs,
 			filepath.Join(current, ".agents", "skills"),
 			filepath.Join(current, ".codex", "skills"),
-			// Keep project-local Claude-format skills portable to Codex.
-			filepath.Join(current, ".claude", "skills"),
 		)
 		if stopAt != "" && sameCodexPath(current, stopAt) {
 			break

@@ -314,11 +314,21 @@ func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int
 // ── SkillProvider ────────────────────────────────────────────
 
 func (a *Agent) SkillDirs() []string {
-	absDir, err := filepath.Abs(a.workDir)
+	a.mu.Lock()
+	workDir := a.workDir
+	a.mu.Unlock()
+	absDir, err := filepath.Abs(workDir)
 	if err != nil {
-		absDir = a.workDir
+		absDir = workDir
 	}
-	dirs := []string{filepath.Join(absDir, ".pi", "agent", "skills")}
+	// Pi uses .pi/skills at project scope; .pi/agent/skills is its global
+	// layout. Keep the legacy project path for existing bridge installations.
+	// Project skills precede global skills so local instructions win by name.
+	dirs := []string{
+		filepath.Join(absDir, ".pi", "skills"),
+		filepath.Join(absDir, ".agents", "skills"),
+		filepath.Join(absDir, ".pi", "agent", "skills"),
+	}
 
 	homeDir, err := os.UserHomeDir()
 	if err == nil {
