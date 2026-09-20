@@ -483,14 +483,14 @@ func parseKimiSessionDir(sessionDir, filterWorkDir string) *core.AgentSessionInf
 		return nil
 	}
 
-	// Two state.json schemas (#1561): legacy kimi-cli stores
-	// {"custom_title","archived"}; the Kimi Code CLI stores
-	// {"title","workDir","updatedAt",...} with no archived flag.
+	// Legacy kimi-cli stores custom_title; Kimi Code uses title and records
+	// the working directory as cwd (formerly workDir).
 	var state struct {
 		CustomTitle string `json:"custom_title"`
 		Title       string `json:"title"`
 		Archived    bool   `json:"archived"`
 		WorkDir     string `json:"workDir"`
+		CWD         string `json:"cwd"`
 	}
 	if json.Unmarshal(stateData, &state) != nil {
 		return nil
@@ -499,13 +499,17 @@ func parseKimiSessionDir(sessionDir, filterWorkDir string) *core.AgentSessionInf
 		return nil
 	}
 
-	// The Kimi Code CLI records the session's workDir, so unlike the legacy
+	// The Kimi Code CLI records the session's cwd, so unlike the legacy
 	// flavor (which stores no cwd and is always listed) we can honor the
 	// caller's workDir filter for it.
-	if state.WorkDir != "" && filterWorkDir != "" {
-		absStateDir, err := filepath.Abs(state.WorkDir)
+	workDir := state.CWD
+	if workDir == "" {
+		workDir = state.WorkDir
+	}
+	if workDir != "" && filterWorkDir != "" {
+		absStateDir, err := filepath.Abs(workDir)
 		if err != nil {
-			absStateDir = state.WorkDir
+			absStateDir = workDir
 		}
 		if absStateDir != filterWorkDir {
 			return nil
