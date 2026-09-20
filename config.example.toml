@@ -58,6 +58,18 @@
 # 也可用环境变量 CC_MAX_ATTACHMENT_SIZE_MB 覆盖（同样单位 MiB；设置后优先级高于本配置项）。
 # max_attachment_size_mb = 50
 
+# Stale busy-lock self-heal threshold (minutes). When a message arrives, the
+# session is busy, the agent process is dead, and the lock has been held longer
+# than this, cc-connect dumps goroutine stacks to the OS temp dir, breaks the
+# lock, and processes the message in a fresh turn. Live agents are never
+# touched (process-alive gate), so long-running turns are safe at any value.
+# Default: 2 (just above the 120s graceful-stop wait). 0 disables the breaker.
+# 会话忙锁自愈阈值（分钟）。消息到达时会话忙、agent 进程已死、且锁持有超过该时长时，
+# cc-connect 会把 goroutine 栈转储到系统临时目录、破锁并在新 turn 中处理该消息。
+# 存活的长任务永远不会被触碰（进程存活门控），任何取值都安全。
+# 默认 2（略高于 120 秒优雅停止等待）。设 0 关闭该自愈。
+# busy_timeout_mins = 2
+
 [log]
 level = "info" # debug, info, warn, error
 

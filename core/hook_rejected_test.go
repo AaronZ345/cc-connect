@@ -28,7 +28,7 @@ func TestProcessInteractiveEvents_DropsStopHookRejectedDraft(t *testing.T) {
 	agentSession.events <- Event{Type: EventText, Content: "BBB"}
 	agentSession.events <- Event{Type: EventResult, Content: "BBB", Done: true}
 
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-hook-rejected", time.Now(), nil, nil, state.replyCtx)
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-hook-rejected", time.Now(), nil, nil, state.replyCtx, 0)
 
 	if got := p.getSent(); len(got) != 1 || got[0] != "BBB" {
 		t.Fatalf("final reply = %#v, want only rewritten text %q", got, "BBB")
@@ -58,7 +58,7 @@ func TestProcessInteractiveEvents_NoHookRejectionKeepsTextAcrossToolBoundary(t *
 	agentSession.events <- Event{Type: EventText, Content: "BBB"}
 	agentSession.events <- Event{Type: EventResult, Content: "BBB", Done: true}
 
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-no-hook-rejection", time.Now(), nil, nil, state.replyCtx)
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-no-hook-rejection", time.Now(), nil, nil, state.replyCtx, 0)
 
 	if got := p.getSent(); len(got) != 1 || got[0] != "AAABBB" {
 		t.Fatalf("final reply = %#v, want text across hidden tool boundary %q", got, "AAABBB")

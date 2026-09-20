@@ -406,14 +406,15 @@ type Engine struct {
 	userRoles    *UserRoleManager // nil = legacy mode (no per-user policies)
 	userRolesMu  sync.RWMutex     // protects userRoles, disabledCmds, and adminFrom
 
-	rateLimiter      *RateLimiter
-	outgoingRL       *OutgoingRateLimiter
-	streamPreview    StreamPreviewCfg
-	instantReply     InstantReplyCfg
-	references       ReferenceRenderCfg
-	relayManager     *RelayManager
-	eventIdleTimeout time.Duration
-	maxTurnTime      time.Duration // absolute wall-clock cap per turn (0 = disabled)
+	rateLimiter         *RateLimiter
+	outgoingRL          *OutgoingRateLimiter
+	streamPreview       StreamPreviewCfg
+	instantReply        InstantReplyCfg
+	references          ReferenceRenderCfg
+	relayManager        *RelayManager
+	eventIdleTimeout    time.Duration
+	staleLockBreakAfter time.Duration // busy-lock stale-break threshold; 0 disables
+	maxTurnTime         time.Duration // absolute wall-clock cap per turn (0 = disabled)
 	// agentSessionIdleTimeoutNanos 在单轮正常结束后关闭空闲的 live agent 进程，
 	// 同时保留已保存的 session ID，便于下次继续恢复。
 	agentSessionIdleTimeoutNanos atomic.Int64
@@ -551,7 +552,11 @@ type queuedMessage struct {
 
 // interactiveState tracks a running interactive agent session and its permission state.
 type interactiveState struct {
-	agentSession             AgentSession
+	agentSession AgentSession
+	// busySession is the core.Session whose busy lock guards the in-flight
+	// turn. Set by getOrCreateInteractiveStateWith so /stop can release the
+	// lock after tearing the turn down (#1830).
+	busySession              *Session
 	platform                 Platform
 	replyCtx                 any
 	currentMessageID         string
@@ -785,6 +790,7 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		streamPreview:         DefaultStreamPreviewCfg(),
 		references:            DefaultReferenceRenderCfg(),
 		eventIdleTimeout:      defaultEventIdleTimeout,
+		staleLockBreakAfter:   busyStaleLockMaxHeld,
 		maxQueuedMessages:     defaultMaxQueuedMessages,
 		showContextIndicator:  true,
 		showWorkdirIndicator:  true,
@@ -1402,6 +1408,12 @@ func (e *Engine) SetMaxTurnTime(d time.Duration) {
 	e.maxTurnTime = d
 }
 
+// SetStaleLockBreakAfter sets how long the busy lock may be held by a dead
+// agent process before the next incoming message breaks it. 0 disables.
+func (e *Engine) SetStaleLockBreakAfter(d time.Duration) {
+	e.staleLockBreakAfter = d
+}
+
 // SetEventIdleTimeout sets the maximum time to wait between consecutive agent events.
 // 0 disables the timeout entirely.
 func (e *Engine) SetEventIdleTimeout(d time.Duration) {
@@ -1651,7 +1663,8 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	if useNewSession {
 		msg.SessionKey = runSessionKey
 		session := sessions.NewSideSession(runSessionKey, "cron-"+job.ID)
-		if !session.TryLock() {
+		lockGen, locked := session.TryLock()
+		if !locked {
 			return fmt.Errorf("session %q is busy", runSessionKey)
 		}
 		iKey := fmt.Sprintf("%s#cron:%s", runSessionKey, session.ID)
@@ -1659,7 +1672,7 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 			iKey = workspaceDir + ":" + iKey
 		}
 		prevHistLen := session.HistoryLen()
-		e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey)
+		e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey, lockGen)
 		e.cleanupInteractiveState(iKey)
 		// Empty-response detection via session history delta: processInteractiveMessageWith
 		// always adds a "user" entry (prevHistLen+1), then an "assistant" entry on success
@@ -1673,7 +1686,8 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	}
 
 	session := sessions.GetOrCreateActive(sessionKey)
-	if !session.TryLock() {
+	lockGen, locked := session.TryLock()
+	if !locked {
 		return fmt.Errorf("session %q is busy", sessionKey)
 	}
 
@@ -1682,7 +1696,7 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		iKey = workspaceDir + ":" + sessionKey
 	}
 	prevHistLen := session.HistoryLen()
-	e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey)
+	e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey, lockGen)
 	// Same empty-response detection as the useNewSession path above.
 	if !job.Mute && session.HistoryLen() < prevHistLen+2 {
 		return fmt.Errorf("cron job %q produced an empty response", job.ID)
@@ -1854,20 +1868,22 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 	if useNewSession {
 		msg.SessionKey = runSessionKey
 		session := sessions.NewSideSession(runSessionKey, "timer-"+job.ID)
-		if !session.TryLock() {
+		lockGen, locked := session.TryLock()
+		if !locked {
 			return fmt.Errorf("session %q is busy", runSessionKey)
 		}
 		iKey := fmt.Sprintf("%s#timer:%s", runSessionKey, session.ID)
 		if workspaceDir != "" {
 			iKey = workspaceDir + ":" + iKey
 		}
-		e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey)
+		e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey, lockGen)
 		e.cleanupInteractiveState(iKey)
 		return nil
 	}
 
 	session := sessions.GetOrCreateActive(sessionKey)
-	if !session.TryLock() {
+	lockGen, locked := session.TryLock()
+	if !locked {
 		return fmt.Errorf("session %q is busy", sessionKey)
 	}
 
@@ -1875,7 +1891,7 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 	if workspaceDir != "" {
 		iKey = workspaceDir + ":" + sessionKey
 	}
-	e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey)
+	e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey, lockGen)
 	return nil
 }
 
@@ -2329,11 +2345,12 @@ func (e *Engine) ExecuteHeartbeat(sessionKey, prompt string, silent bool) error 
 	}
 
 	session := e.sessions.GetOrCreateActive(sessionKey)
-	if !session.TryLock() {
+	lockGen, locked := session.TryLock()
+	if !locked {
 		return fmt.Errorf("session %q is busy", sessionKey)
 	}
 
-	e.processInteractiveMessage(targetPlatform, msg, session)
+	e.processInteractiveMessage(targetPlatform, msg, session, lockGen)
 	return nil
 }
 
@@ -2802,19 +2819,128 @@ func (e *Engine) stopCurrentMessageIfRecalled(sessionKey string) bool {
 	return false
 }
 
-func (e *Engine) waitForSessionLock(session *Session, timeout time.Duration) bool {
+func (e *Engine) waitForSessionLock(session *Session, timeout time.Duration) (uint64, bool) {
 	deadline := time.Now().Add(timeout)
 	for {
-		if session.TryLock() {
-			return true
+		if gen, ok := session.TryLock(); ok {
+			return gen, true
 		}
 		if time.Now().After(deadline) {
-			return false
+			return 0, false
 		}
 		select {
 		case <-e.ctx.Done():
-			return false
+			return 0, false
 		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+// sanitizeFileToken reduces a session key to a filename-safe token.
+func sanitizeFileToken(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+		if b.Len() > 60 {
+			break
+		}
+	}
+	return b.String()
+}
+
+// dumpGoroutineStacks writes all goroutine stacks to path for post-mortem
+// diagnosis of a wedged turn. Guarded by a timeout so a wedged runtime
+// (GC stall) cannot block recovery itself.
+func dumpGoroutineStacks(path string) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 1<<22)
+		n := runtime.Stack(buf, true)
+		if err := os.WriteFile(path, buf[:n], 0o0600); err != nil {
+			slog.Warn("busy lock: failed to write goroutine stack dump", "path", path, "error", err)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		slog.Warn("busy lock: goroutine stack dump timed out; continuing recovery")
+	}
+}
+
+// staleLockDumpKeep is how many busy-stale-*.txt goroutine dumps are retained
+// in the dump dir; older ones are pruned on each new dump.
+const staleLockDumpKeep = 5
+
+// staleLockDumpDir returns the private directory stale-lock goroutine dumps
+// are written to (0700 under the OS temp dir). Goroutine stacks can embed
+// message text, so dumps must not be world-readable in a shared /tmp, and the
+// private dir narrows (not fully defeats — MkdirAll does not verify ownership
+// of a pre-existing directory; an ownership check is follow-up material)
+// symlink planting under predictable filenames. For a single cc-connect
+// instance prune sees only its own files; if several instances of the same
+// user share the host, they share this dir and the 5-dump retention becomes
+// a global cap — still bounded, just not per-process.
+func staleLockDumpDir() (string, error) {
+	dir := filepath.Join(os.TempDir(), "busy-stale-dumps")
+	if err := os.MkdirAll(dir, 0o0700); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// staleLockDumpName renders a dump filename. The zero-padded fixed-width
+// 13-digit timestamp prefix makes lexicographic order chronological across
+// sessions (modulo local clock skew), regardless of session key.
+func staleLockDumpName(ts int64, sessionKey string) string {
+	return fmt.Sprintf("busy-stale-%013d-%s.txt", ts, sanitizeFileToken(sessionKey))
+}
+
+// dumpStaleLockStacks writes the goroutine dump for a stale-lock self-heal
+// event into staleLockDumpDir() — never the process working directory, which
+// may be a source checkout or the data dir — and prunes old dumps. The write
+// itself is async and best-effort: a hard daemon exit before it completes
+// loses that dump, which is acceptable (recovery never depends on it).
+func dumpStaleLockStacks(sessionKey string) {
+	dir, err := staleLockDumpDir()
+	if err != nil {
+		slog.Debug("busy lock: cannot create dump dir", "error", err)
+		return
+	}
+	dumpGoroutineStacks(filepath.Join(dir, staleLockDumpName(time.Now().Unix(), sessionKey)))
+	pruneStaleLockDumps(dir, staleLockDumpKeep)
+}
+
+// pruneStaleLockDumps removes the oldest busy-stale-*.txt dumps beyond keep.
+// Best-effort and lock-free: two prunes racing to remove the same file is
+// fine (IsNotExist ignored), and a dump written after this prune's ReadDir
+// simply survives one extra cycle. Failures only log at debug level —
+// retention is housekeeping, never a recovery blocker.
+func pruneStaleLockDumps(dir string, keep int) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		slog.Debug("busy lock: prune readdir failed", "dir", dir, "error", err)
+		return
+	}
+	var dumps []os.DirEntry
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), "busy-stale-") || !strings.HasSuffix(e.Name(), ".txt") {
+			continue
+		}
+		dumps = append(dumps, e)
+	}
+	if len(dumps) <= keep {
+		return
+	}
+	sort.Slice(dumps, func(i, j int) bool { return dumps[i].Name() < dumps[j].Name() })
+	for _, e := range dumps[:len(dumps)-keep] {
+		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil && !os.IsNotExist(err) {
+			slog.Debug("busy lock: failed to prune stale stack dump", "file", e.Name(), "error", err)
 		}
 	}
 }
@@ -3064,14 +3190,52 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	// Without this, concurrent messages can observe the session as busy during
 	// startup but still find no state to queue into.
 	e.ensureInteractiveStateForQueueing(interactiveKey, p, msg.ReplyCtx)
-	if !session.TryLock() {
+	var lockGen uint64
+	if gen, locked := session.TryLock(); locked {
+		lockGen = gen
+	} else {
 		if e.stopCurrentMessageIfRecalled(interactiveKey) {
-			if e.waitForSessionLock(session, recalledStopLockWait) {
+			if g, ok := e.waitForSessionLock(session, recalledStopLockWait); ok {
+				lockGen = g
 				goto sessionLocked
 			}
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
 			return
 		}
+		// ── busy stale-lock self-heal (custom 2026-09-12) ──────────────────
+		// Agent process dead + busy flag still held = black-hole turn (leaked
+		// lock). Break it and process this message in a fresh turn instead of
+		// queueing into a session nobody will ever drain. Live agents never
+		// hit this (Alive() gate); the held-threshold keeps us clear of
+		// graceful-stop waits. An agent that is hung but still PID-alive also
+		// falls through to normal queueing by design — breaking a live
+		// process's lock is out of scope for this path. Lock order:
+		// interactiveMu → session.mu, never reversed.
+		e.interactiveMu.Lock()
+		st, hasSt := e.interactiveStates[interactiveKey]
+		agentAlive := hasSt && st != nil && st.agentSession != nil && st.agentSession.Alive()
+		e.interactiveMu.Unlock()
+		if !agentAlive && e.staleLockBreakAfter > 0 {
+			if since, broken := session.BreakStaleLock(e.staleLockBreakAfter); broken {
+				heldFor := time.Since(since).Round(time.Second)
+				slog.Warn("busy-stale-lock: agent process dead but lock held; broken (self-heal)",
+					"session", msg.SessionKey,
+					"interactive_key", interactiveKey,
+					"held_for", heldFor,
+				)
+				e.reply(p, msg.ReplyCtx, fmt.Sprintf("⚠️ 会话卡锁已自动恢复（进程已退出但锁未释放，挂了 %s），本条消息继续处理。", heldFor))
+				// Dump only when a break actually fired: a message arriving
+				// while the lock is busy-but-not-yet-breakable must not churn
+				// megabyte dumps, and only the goroutine that won the break
+				// writes one (same-second filename collisions are impossible).
+				dumpStaleLockStacks(msg.SessionKey)
+				if g, ok := session.TryLock(); ok {
+					lockGen = g
+					goto sessionLocked
+				}
+			}
+		}
+		// ── end self-heal; queueing path below is unchanged ────────────────
 		// Session is busy — try to queue the message for the running turn
 		// so the agent processes it immediately after the current turn ends.
 		if e.queueMessageForBusySession(p, msg, interactiveKey) {
@@ -3079,8 +3243,8 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 			// have just finished (session unlocked) between our TryLock failure
 			// and the queue append. Re-try TryLock — if it succeeds, no one is
 			// draining the queue so we must start a processor ourselves.
-			if session.TryLock() {
-				go e.drainOrphanedQueue(session, sessions, interactiveKey, agent, resolvedWorkspace)
+			if g, ok := session.TryLock(); ok {
+				go e.drainOrphanedQueue(session, sessions, interactiveKey, agent, resolvedWorkspace, g)
 			}
 			return
 		}
@@ -3089,8 +3253,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	}
 
 sessionLocked:
-	if rotated := e.maybeAutoResetSessionOnIdle(p, msg, sessions, interactiveKey, session); rotated != nil {
+	if rotated, rgen := e.maybeAutoResetSessionOnIdle(p, msg, sessions, interactiveKey, session, lockGen); rotated != nil {
 		session = rotated
+		lockGen = rgen
 	}
 	// Record that a real user message is being processed. This keeps
 	// LastUserActivity separate from UpdatedAt (bumped by every Unlock), so
@@ -3119,7 +3284,7 @@ sessionLocked:
 		"session", session.ID,
 	)
 
-	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey)
+	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey, lockGen)
 }
 
 func runMessageAccepted(msg *Message) {
@@ -3131,15 +3296,15 @@ func runMessageAccepted(msg *Message) {
 	callback()
 }
 
-func (e *Engine) maybeAutoResetSessionOnIdle(p Platform, msg *Message, sessions *SessionManager, interactiveKey string, session *Session) *Session {
+func (e *Engine) maybeAutoResetSessionOnIdle(p Platform, msg *Message, sessions *SessionManager, interactiveKey string, session *Session, lockGen uint64) (*Session, uint64) {
 	if e.resetOnIdle <= 0 || session == nil {
-		return nil
+		return nil, 0
 	}
 
 	hasBackend := session.GetAgentSessionID() != ""
 	hasHistory := len(session.GetHistory(1)) > 0
 	if !hasBackend && !hasHistory {
-		return nil
+		return nil, 0
 	}
 
 	// Prefer LastUserActivity for idle tracking: it is only updated on actual
@@ -3168,7 +3333,7 @@ func (e *Engine) maybeAutoResetSessionOnIdle(p Platform, msg *Message, sessions 
 		}
 	}
 	if lastActive.IsZero() || time.Since(lastActive) < e.resetOnIdle {
-		return nil
+		return nil, 0
 	}
 
 	slog.Info("auto-resetting idle session",
@@ -3192,24 +3357,25 @@ func (e *Engine) maybeAutoResetSessionOnIdle(p Platform, msg *Message, sessions 
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSessionClosingGraceful))
 	}
 
-	// Lock the replacement session BEFORE releasing the old one. If the new
-	// lock fails we must return with the old session still locked — the
-	// caller assumes the session it passed in stays locked when we return
-	// nil. Releasing first (previous order) left the incoming turn running
-	// without the busy lock, allowing concurrent turns on one session.
-	// (issue #1832)
+	// Lock the replacement session BEFORE releasing the old one (#1847 /
+	// #1832). If the new lock fails we must return with the old session
+	// still locked — the caller assumes the session it passed in stays
+	// locked when we return nil. Releasing first allowed concurrent turns
+	// on one session. Generation counters (#1838) are used for the unlock.
 	newSession := sessions.NewSession(msg.SessionKey, "")
-	if !newSession.TryLock() {
+	newGen, ok := newSession.TryLock()
+	if !ok {
 		slog.Error("failed to lock new session after idle auto-reset; keeping the current session locked",
 			"session_key", msg.SessionKey, "new_session", newSession.ID)
-		return nil
+		return nil, 0
 	}
 
+	// New session is locked — now safe to release the old one.
 	e.cleanupInteractiveState(interactiveKey)
-	session.UnlockWithoutUpdate()
+	session.UnlockWithoutUpdate(lockGen)
 
 	e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgSessionAutoResetIdle, int(e.resetOnIdle/time.Minute)))
-	return newSession
+	return newSession, newGen
 }
 
 // queueMessageForBusySession queues a message for later delivery when the
@@ -3307,11 +3473,11 @@ func (e *Engine) ensureInteractiveStateForQueueing(key string, p Platform, reply
 // has already exited. It processes all pending messages in the state, similar
 // to the drain loop in processInteractiveMessageWith but as a standalone
 // goroutine.
-func (e *Engine) drainOrphanedQueue(session *Session, sessions *SessionManager, interactiveKey string, agent Agent, workspaceDir string) {
+func (e *Engine) drainOrphanedQueue(session *Session, sessions *SessionManager, interactiveKey string, agent Agent, workspaceDir string, lockGen uint64) {
 	unlocked := false
 	defer func() {
 		if !unlocked {
-			session.Unlock()
+			session.Unlock(lockGen)
 		}
 	}()
 
@@ -3330,7 +3496,7 @@ func (e *Engine) drainOrphanedQueue(session *Session, sessions *SessionManager, 
 	// from Events() and we must not have concurrent readers.
 	e.stopUnsolicitedReader(state)
 
-	unlocked = e.drainPendingMessages(state, session, sessions, interactiveKey)
+	unlocked = e.drainPendingMessages(state, session, sessions, interactiveKey, lockGen)
 
 	// Restart unsolicited reader if the session is still alive and clean.
 	state.mu.Lock()
@@ -3754,15 +3920,17 @@ func isDenyResponse(s string) bool {
 // Interactive agent processing
 // ──────────────────────────────────────────────────────────────
 
-func (e *Engine) processInteractiveMessage(p Platform, msg *Message, session *Session) {
-	e.processInteractiveMessageWith(p, msg, session, e.agent, e.sessions, msg.SessionKey, "", "")
+func (e *Engine) processInteractiveMessage(p Platform, msg *Message, session *Session, lockGen uint64) {
+	e.processInteractiveMessageWith(p, msg, session, e.agent, e.sessions, msg.SessionKey, "", "", lockGen)
 }
 
 // processInteractiveMessageWith is the core interactive processing loop.
 // It accepts an explicit agent, interactiveKey (for the interactiveStates map),
 // and workspaceDir so that multi-workspace mode can route to per-workspace agents.
 // ccSessionKey, when non-empty, is used for CC_SESSION_KEY in the agent env; otherwise interactiveKey is used.
-func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session *Session, agent Agent, sessions *SessionManager, interactiveKey string, workspaceDir string, ccSessionKey string) {
+// lockGen is the generation returned by the TryLock that acquired this turn's
+// busy lock; it must be passed to every session.Unlock of this turn (custom 2026-09-12).
+func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session *Session, agent Agent, sessions *SessionManager, interactiveKey string, workspaceDir string, ccSessionKey string, lockGen uint64) {
 	// session.Unlock() is NOT deferred here — it is called explicitly in
 	// the drain loop below while holding state.mu to close the race window
 	// between "queue is empty" and "session unlocked". A deferred fallback
@@ -3770,7 +3938,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	unlocked := false
 	defer func() {
 		if !unlocked {
-			session.Unlock()
+			session.Unlock(lockGen)
 		}
 	}()
 
@@ -3894,7 +4062,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		sendDone <- as.Send(promptContent, msg.MessageID, msg.Images, msg.Files)
 	}()
 
-	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx)
+	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx, lockGen)
 	if elapsed := time.Since(sendStart); elapsed >= slowAgentSend {
 		slog.Warn("slow agent send", "elapsed", elapsed, "session", msg.SessionKey, "content_len", len(msg.Content))
 	}
@@ -3921,7 +4089,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	// processInteractiveEvents observing an empty queue and returning here
 	// (session is still locked, so handleMessage's TryLock fails and routes
 	// the message to queueMessageForBusySession). Drain any such orphans.
-	if e.drainPendingMessages(state, session, sessions, interactiveKey) {
+	if e.drainPendingMessages(state, session, sessions, interactiveKey, lockGen) {
 		unlocked = true
 	}
 }
@@ -4092,6 +4260,9 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		// a concrete ID, reusing would keep --resume context — recycle (#238).
 		needRecycle := currentID != "" && (wantID == "" || wantID != currentID)
 		if !needRecycle {
+			state.mu.Lock()
+			state.busySession = session
+			state.mu.Unlock()
 			return state
 		}
 		// Tear down the stale agent so we start one that matches the Session below.
@@ -4154,7 +4325,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	// Check if context is already canceled (e.g. during shutdown/restart)
 	if e.ctx.Err() != nil {
 		slog.Debug("skipping session start: context canceled", "session_key", sessionKey)
-		newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true}
+		newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true, busySession: session}
 		adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], newState)
 		state = newState
 		e.interactiveStates[sessionKey] = state
@@ -4231,7 +4402,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 				Platform:   p.Name(),
 				Error:      fmt.Sprintf("failed to start session: %v", err),
 			})
-			newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true}
+			newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true, busySession: session}
 			adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], newState)
 			state = newState
 			e.interactiveStates[sessionKey] = state
@@ -4270,6 +4441,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 
 	newState := &interactiveState{
 		agentSession:     agentSession,
+		busySession:      session,
 		platform:         p,
 		replyCtx:         replyCtx,
 		agent:            agent,
@@ -4995,7 +5167,7 @@ var agentErrorHandlers = []agentErrorHandler{
 	{"Session not found", MsgSessionNotFound},
 }
 
-func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any) {
+func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any, lockGen uint64) {
 	if msgID != "" {
 		state.mu.Lock()
 		state.currentMessageID = msgID
@@ -6192,7 +6364,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					e.send(state.platform, state.replyCtx, compressNotice)
 
 					// Run compress inline while the session is still locked.
-					e.runCompress(state, session, sessions, sessionKey, state.platform, state.replyCtx, true)
+					e.runCompress(state, session, sessions, sessionKey, state.platform, state.replyCtx, true, lockGen)
 					return
 				}
 			}
@@ -6530,11 +6702,11 @@ func (e *Engine) notifyDroppedQueuedMessages(state *interactiveState, reason err
 // queue. It atomically unlocks the session when the queue is empty (while holding
 // state.mu) to close the race window between "queue empty" and "session unlocked".
 // Returns true if the session was unlocked by this call.
-func (e *Engine) drainPendingMessages(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string) bool {
+func (e *Engine) drainPendingMessages(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, lockGen uint64) bool {
 	for {
 		state.mu.Lock()
 		if len(state.pendingMessages) == 0 {
-			session.Unlock()
+			session.Unlock(lockGen)
 			state.mu.Unlock()
 			return true
 		}
@@ -6550,7 +6722,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 			)
 		}
 		if len(state.pendingMessages) == 0 {
-			session.Unlock()
+			session.Unlock(lockGen)
 			state.mu.Unlock()
 			return true
 		}
@@ -6594,7 +6766,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		}
 
 		slog.Info("processing queued message", "session", sessionKey)
-		e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx)
+		e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx, lockGen)
 	}
 }
 
@@ -10507,6 +10679,10 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 			goto normalCleanup
 		}
 
+		if state.busySession != nil && state.busySession.ForceUnlock() {
+			slog.Info("session busy lock released after turn cancel", "session_key", sessionKey)
+		}
+
 		slog.Info("agent session turn cancelled, session kept alive",
 			"session_key", sessionKey)
 
@@ -10534,6 +10710,15 @@ normalCleanup:
 		state.mu.Unlock()
 	}
 	e.closeAgentSessionAsync(sessionKey, agentSession, closePlatform, closeReplyCtx)
+
+	// The stopped turn can never run its own Unlock — release its busy lock
+	// so the next message starts a fresh turn instead of queueing behind a
+	// dead one (#1830). ForceUnlock bumps the generation, so a late Unlock
+	// from the interrupted turn's goroutine (if it eventually unsticks) is
+	// dropped by the gen check.
+	if state.busySession != nil && state.busySession.ForceUnlock() {
+		slog.Info("session busy lock released after stop", "session_key", sessionKey)
+	}
 
 	e.hooks.Emit(HookEvent{
 		Event:      HookEventSessionEnded,
@@ -10576,26 +10761,27 @@ func (e *Engine) cmdCompress(p Platform, msg *Message) {
 	}
 
 	session := sessions.GetOrCreateActive(msg.SessionKey)
-	if !session.TryLock() {
+	lockGen, locked := session.TryLock()
+	if !locked {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
 		return
 	}
 
 	e.send(p, msg.ReplyCtx, e.i18n.T(MsgCompressing))
 
-	go e.runCompress(state, session, sessions, iKey, p, msg.ReplyCtx, false)
+	go e.runCompress(state, session, sessions, iKey, p, msg.ReplyCtx, false, lockGen)
 }
 
 // runCompress sends the agent's compress command and handles results.
 // If autoTriggered is true, suppress user-visible "compressing" and completion messages.
-func (e *Engine) runCompress(state *interactiveState, session *Session, sessions *SessionManager, iKey string, p Platform, replyCtx any, auto bool) {
+func (e *Engine) runCompress(state *interactiveState, session *Session, sessions *SessionManager, iKey string, p Platform, replyCtx any, auto bool, lockGen uint64) {
 	// session.Unlock() is called inside drainQueuedMessagesAfterCompress
 	// while holding state.mu to close the race window. Deferred fallback
 	// ensures the lock is released on early-return paths.
 	compressUnlocked := false
 	defer func() {
 		if !compressUnlocked {
-			session.Unlock()
+			session.Unlock(lockGen)
 		}
 	}()
 
@@ -10628,13 +10814,13 @@ func (e *Engine) runCompress(state *interactiveState, session *Session, sessions
 		return
 	}
 
-	e.processCompressEvents(state, session, sessions, iKey, p, replyCtx, &compressUnlocked, auto)
+	e.processCompressEvents(state, session, sessions, iKey, p, replyCtx, &compressUnlocked, auto, lockGen)
 }
 
 // processCompressEvents drains agent events after a compress command.
 // Unlike processInteractiveEvents it does NOT record history and treats
 // an empty result as success rather than "(empty response)".
-func (e *Engine) processCompressEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, p Platform, replyCtx any, unlocked *bool, auto bool) {
+func (e *Engine) processCompressEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, p Platform, replyCtx any, unlocked *bool, auto bool, lockGen uint64) {
 
 	var textParts []string
 	events := state.agentSession.Events()
@@ -10727,7 +10913,7 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 			}
 
 			// After compress succeeds, process any queued messages instead of dropping them.
-			e.drainQueuedMessagesAfterCompress(state, session, sessions, sessionKey, unlocked)
+			e.drainQueuedMessagesAfterCompress(state, session, sessions, sessionKey, unlocked, lockGen)
 			return
 		case EventError:
 			if !auto && event.Error != nil {
@@ -10739,7 +10925,7 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 				e.notifyDroppedQueuedMessages(state, event.Error)
 			} else {
 				// Agent survived — try to process queued messages.
-				e.drainQueuedMessagesAfterCompress(state, session, sessions, sessionKey, unlocked)
+				e.drainQueuedMessagesAfterCompress(state, session, sessions, sessionKey, unlocked, lockGen)
 			}
 			return
 		case EventPermissionRequest:
@@ -10754,8 +10940,8 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 // drainQueuedMessagesAfterCompress processes any messages that were queued
 // during a /compress operation. It sends each one to the agent and runs the
 // full interactive event loop for it.
-func (e *Engine) drainQueuedMessagesAfterCompress(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, unlocked *bool) {
-	if e.drainPendingMessages(state, session, sessions, sessionKey) {
+func (e *Engine) drainQueuedMessagesAfterCompress(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, unlocked *bool, lockGen uint64) {
+	if e.drainPendingMessages(state, session, sessions, sessionKey, lockGen) {
 		*unlocked = true
 	}
 }
@@ -14886,7 +15072,8 @@ func (e *Engine) executeCustomCommand(p Platform, msg *Message, cmd *CustomComma
 	}
 
 	session := sessions.GetOrCreateActive(interactiveKey)
-	if !session.TryLock() {
+	lockGen, locked := session.TryLock()
+	if !locked {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
 		return
 	}
@@ -14899,7 +15086,7 @@ func (e *Engine) executeCustomCommand(p Platform, msg *Message, cmd *CustomComma
 	)
 
 	msg.Content = prompt
-	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey)
+	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey, lockGen)
 }
 
 // executeShellCommand runs a shell command and sends the output to the user.
@@ -15114,7 +15301,8 @@ func (e *Engine) executeSkill(p Platform, msg *Message, skill *Skill, args []str
 	}
 
 	session := sessions.GetOrCreateActive(interactiveKey)
-	if !session.TryLock() {
+	lockGen, locked := session.TryLock()
+	if !locked {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
 		return
 	}
@@ -15127,7 +15315,7 @@ func (e *Engine) executeSkill(p Platform, msg *Message, skill *Skill, args []str
 	)
 
 	msg.Content = prompt
-	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey)
+	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey, lockGen)
 }
 
 func (e *Engine) cmdSkills(p Platform, msg *Message) {
