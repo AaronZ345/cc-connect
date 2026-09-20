@@ -3164,14 +3164,21 @@ func (e *Engine) maybeAutoResetSessionOnIdle(p Platform, msg *Message, sessions 
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSessionClosingGraceful))
 	}
 
-	e.cleanupInteractiveState(interactiveKey)
-	session.UnlockWithoutUpdate()
-
+	// Lock the replacement session BEFORE releasing the old one. If the new
+	// lock fails we must return with the old session still locked — the
+	// caller assumes the session it passed in stays locked when we return
+	// nil. Releasing first (previous order) left the incoming turn running
+	// without the busy lock, allowing concurrent turns on one session.
+	// (issue #1832)
 	newSession := sessions.NewSession(msg.SessionKey, "")
 	if !newSession.TryLock() {
-		slog.Error("failed to lock new session after idle auto-reset", "session_key", msg.SessionKey, "new_session", newSession.ID)
+		slog.Error("failed to lock new session after idle auto-reset; keeping the current session locked",
+			"session_key", msg.SessionKey, "new_session", newSession.ID)
 		return nil
 	}
+
+	e.cleanupInteractiveState(interactiveKey)
+	session.UnlockWithoutUpdate()
 
 	e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgSessionAutoResetIdle, int(e.resetOnIdle/time.Minute)))
 	return newSession
