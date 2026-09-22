@@ -4072,7 +4072,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	// after the recalled one are independent user turns and must survive. Move
 	// them into a replacement interactive state and continue with the oldest
 	// queued message while retaining ownership of the session lock.
-	if e.resumePendingAfterStoppedTurn(state, session, sessions, interactiveKey, agent, workspaceDir, ccSessionKey) {
+	if e.resumePendingAfterStoppedTurn(state, session, sessions, interactiveKey, agent, workspaceDir, ccSessionKey, lockGen) {
 		unlocked = true // the nested processor now owns and releases the lock
 		return
 	}
@@ -4107,7 +4107,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 // messages that were queued after an intentionally stopped turn (currently a
 // recalled active message). It returns true after transferring session-lock
 // ownership to the replacement processor.
-func (e *Engine) resumePendingAfterStoppedTurn(state *interactiveState, session *Session, sessions *SessionManager, interactiveKey string, agent Agent, workspaceDir, ccSessionKey string) bool {
+func (e *Engine) resumePendingAfterStoppedTurn(state *interactiveState, session *Session, sessions *SessionManager, interactiveKey string, agent Agent, workspaceDir, ccSessionKey string, lockGen uint64) bool {
 	state.mu.Lock()
 	if !state.stopped || len(state.pendingMessages) == 0 {
 		state.mu.Unlock()
@@ -4164,7 +4164,7 @@ func (e *Engine) resumePendingAfterStoppedTurn(state *interactiveState, session 
 		"next_msg_id", next.messageID,
 		"remaining_queue", len(pending)-1,
 	)
-	e.processInteractiveMessageWith(next.platform, nextMessage, session, agent, sessions, interactiveKey, workspaceDir, ccSessionKey)
+	e.processInteractiveMessageWith(next.platform, nextMessage, session, agent, sessions, interactiveKey, workspaceDir, ccSessionKey, lockGen)
 	return true
 }
 
