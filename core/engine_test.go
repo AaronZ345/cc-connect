@@ -16568,3 +16568,21 @@ func TestProcessInteractiveEvents_StreamingCard_BareNoReply_Suppressed(t *testin
 		t.Fatalf("silent reply leaked NO_REPLY into the streaming card: %q", card.finalContent())
 	}
 }
+
+func TestEngineSetHideSchedulerSessionsPropagatesToWorkspaceManagers(t *testing.T) {
+	e := NewEngine("test", &stubAgent{}, nil, "", LangEnglish)
+	workspace := t.TempDir()
+	workspaceSessions := NewSessionManager("")
+	workspaceSessions.SetHideBackgroundSessions(false)
+
+	e.workspacePool = newWorkspacePool(0)
+	state := newWorkspaceState(workspace)
+	state.sessions = workspaceSessions
+	e.workspacePool.states[workspace] = state
+
+	e.SetHideSchedulerSessions(true)
+	background := workspaceSessions.NewBackgroundSession("user1", "cron-job")
+	if got := workspaceSessions.VisibleSessions(); len(got) != 0 {
+		t.Fatalf("workspace manager not updated: visible sessions = %#v, want %s hidden", got, background.ID)
+	}
+}
