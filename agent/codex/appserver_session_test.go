@@ -469,6 +469,104 @@ func TestAppServerSession_HandleRequestUserInputWritesCodexResponse(t *testing.T
 	}
 }
 
+func TestAppServerSession_RejectsInterleavedChildServerRequests(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stdin := &lockedWriteCloser{}
+	s := &appServerSession{
+		ctx: ctx, stdin: stdin, events: make(chan core.Event, 8),
+		pendingApprovals: make(map[string]chan core.PermissionResult),
+		currentTurn:      "parent-turn",
+	}
+	s.threadID.Store("parent-thread")
+
+	request := func(id, method, threadID, turnID string) {
+		t.Helper()
+		s.handleServerRequest(serverRequestProbe(t, `"`+id+`"`, method, map[string]any{
+			"threadId": threadID, "turnId": turnID,
+			"command": "echo child", "permissions": map[string]any{"network": true},
+			"questions": []any{map[string]any{"id": "q", "header": "Q", "question": "Child question?"}},
+		}))
+	}
+
+	request("child-1-command", "item/commandExecution/requestApproval", "child-thread-1", "child-turn-1")
+	request("parent-command", "item/commandExecution/requestApproval", "parent-thread", "parent-turn")
+	request("child-2-file", "item/fileChange/requestApproval", "child-thread-2", "child-turn-2")
+	request("child-2-permissions", "item/permissions/requestApproval", "child-thread-2", "child-turn-2")
+	request("child-3-question", "item/tool/requestUserInput", "child-thread-3", "child-turn-3")
+	request("child-3-tool", "item/tool/call", "child-thread-3", "child-turn-3")
+	request("stale-parent-turn", "item/commandExecution/requestApproval", "parent-thread", "old-turn")
+
+	select {
+	case event := <-s.events:
+		if event.Type != core.EventPermissionRequest || event.RequestID != `"parent-command"` || event.ToolName != "Bash" {
+			t.Fatalf("event = %#v, want only parent Bash approval", event)
+		}
+		if err := s.RespondPermission(event.RequestID, core.PermissionResult{Behavior: "allow"}); err != nil {
+			t.Fatalf("respond to parent approval: %v", err)
+		}
+	default:
+		t.Fatal("parent approval was not emitted")
+	}
+	select {
+	case event := <-s.events:
+		t.Fatalf("child request leaked event %#v", event)
+	default:
+	}
+	if got := appServerCurrentTurn(s); got != "parent-turn" {
+		t.Fatalf("current turn = %q, want parent-turn", got)
+	}
+
+	var responses map[string]map[string]json.RawMessage
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		responses = make(map[string]map[string]json.RawMessage)
+		for _, line := range strings.Split(strings.TrimSpace(stdin.String()), "\n") {
+			if line == "" {
+				continue
+			}
+			var response struct {
+				ID     string                     `json:"id"`
+				Result map[string]json.RawMessage `json:"result"`
+			}
+			if err := json.Unmarshal([]byte(line), &response); err != nil {
+				t.Fatalf("decode response %q: %v", line, err)
+			}
+			responses[response.ID] = response.Result
+		}
+		if len(responses) == 7 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(responses) != 7 {
+		t.Fatalf("responses = %v, want all seven requests answered", responses)
+	}
+	for _, id := range []string{"child-1-command", "child-2-file", "stale-parent-turn"} {
+		if string(responses[id]["decision"]) != `"decline"` {
+			t.Fatalf("%s response = %s, want decline", id, responses[id]["decision"])
+		}
+	}
+	if string(responses["parent-command"]["decision"]) != `"accept"` {
+		t.Fatalf("parent response = %s, want accept", responses["parent-command"]["decision"])
+	}
+	if string(responses["child-2-permissions"]["permissions"]) != `{}` {
+		t.Fatalf("child permissions response = %s, want empty permissions", responses["child-2-permissions"]["permissions"])
+	}
+	if string(responses["child-3-question"]["answers"]) != `{}` {
+		t.Fatalf("child question response = %s, want empty answers", responses["child-3-question"]["answers"])
+	}
+	if string(responses["child-3-tool"]["success"]) != `false` {
+		t.Fatalf("child tool response = %s, want unavailable", responses["child-3-tool"]["success"])
+	}
+	s.approvalsMu.Lock()
+	pendingCount := len(s.pendingApprovals)
+	s.approvalsMu.Unlock()
+	if pendingCount != 0 {
+		t.Fatalf("pending approvals = %d, want none", pendingCount)
+	}
+}
+
 var _ interface {
 	GetUsage(context.Context) (*core.UsageReport, error)
 } = (*appServerSession)(nil)
@@ -617,17 +715,17 @@ func waitForWrittenJSONLine(t *testing.T, w *lockedWriteCloser) string {
 
 func TestAppServerListenURL(t *testing.T) {
 	cases := map[string]string{
-		"":                       "",
-		"  ":                     "",
-		"stdio://":               "",
-		"stdio":                  "",
-		"ws://127.0.0.1:3845":    "ws://127.0.0.1:3845",
-		"ws://localhost:9000":    "ws://localhost:9000",
-		"ws://127.0.0.1:3845 ":   "ws://127.0.0.1:3845",
-		" stdio ":                 "",
-		" stdio:// ":               "",
-		"STDIO":                    "",
-		"STDIO://":                 "",
+		"":                     "",
+		"  ":                   "",
+		"stdio://":             "",
+		"stdio":                "",
+		"ws://127.0.0.1:3845":  "ws://127.0.0.1:3845",
+		"ws://localhost:9000":  "ws://localhost:9000",
+		"ws://127.0.0.1:3845 ": "ws://127.0.0.1:3845",
+		" stdio ":              "",
+		" stdio:// ":           "",
+		"STDIO":                "",
+		"STDIO://":             "",
 	}
 	for in, want := range cases {
 		if got := appServerListenURL(in); got != want {
