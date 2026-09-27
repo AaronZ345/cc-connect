@@ -581,6 +581,9 @@ func (s *appServerSession) handleServerRequest(probe map[string]json.RawMessage)
 		return
 	}
 	params := probe["params"]
+	if s.rejectForeignServerRequest(rawID, method, params) {
+		return
+	}
 
 	switch method {
 	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval":
@@ -597,6 +600,39 @@ func (s *appServerSession) handleServerRequest(probe map[string]json.RawMessage)
 			"error": map[string]any{"code": -32601, "message": "method not found"},
 		})
 	}
+}
+
+// rejectForeignServerRequest answers child-thread requests without forwarding
+// their permissions or questions to the parent conversation.
+func (s *appServerSession) rejectForeignServerRequest(rawID json.RawMessage, method string, paramsRaw json.RawMessage) bool {
+	switch method {
+	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+		"item/permissions/requestApproval", "item/tool/requestUserInput", "item/tool/call":
+	default:
+		return false
+	}
+	var ids struct {
+		ThreadID string `json:"threadId"`
+		TurnID   string `json:"turnId"`
+	}
+	if err := json.Unmarshal(paramsRaw, &ids); err != nil || s.acceptsTurnNotification(method, ids.ThreadID, ids.TurnID) {
+		return false
+	}
+
+	var result any
+	switch method {
+	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval":
+		result = map[string]any{"decision": "decline"}
+	case "item/permissions/requestApproval":
+		result = map[string]any{"permissions": map[string]any{}}
+	case "item/tool/requestUserInput":
+		result = appServerRequestUserInputResponse{Answers: map[string]appServerRequestUserInputAnswer{}}
+	case "item/tool/call":
+		s.handleDynamicToolCall(rawID, paramsRaw)
+		return true
+	}
+	_ = s.writeJSON(map[string]any{"jsonrpc": "2.0", "id": rawID, "result": result})
+	return true
 }
 
 func (s *appServerSession) handleApprovalRequest(rawID json.RawMessage, method string, paramsRaw json.RawMessage) {
