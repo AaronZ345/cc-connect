@@ -6096,7 +6096,7 @@ func TestCmdUsage_Success(t *testing.T) {
 	}
 	got := p.sent[0]
 	for _, want := range []string{
-		"Account: dev@example.com (team)",
+		"Account: d*** (team)",
 		"5h limit",
 		"Remaining: 77%",
 		"Resets: 1h 51m",
@@ -6114,7 +6114,7 @@ func TestCmdUsage_Success(t *testing.T) {
 	}
 }
 
-func TestCmdUsage_UsesCardOnCardPlatform(t *testing.T) {
+func TestCmdUsage_CardOmitsEmailRejectedByFeishuAudit(t *testing.T) {
 	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
 	agent := &stubUsageAgent{
 		report: &UsageReport{
@@ -6146,7 +6146,7 @@ func TestCmdUsage_UsesCardOnCardPlatform(t *testing.T) {
 	}
 	text := p.repliedCards[0].RenderText()
 	for _, want := range []string{
-		"账号：dev@example.com (team)",
+		"账号：d*** (team)",
 		"5小时限额",
 		"剩余：77%",
 		"重置：1小时 51分钟",
@@ -6157,6 +6157,9 @@ func TestCmdUsage_UsesCardOnCardPlatform(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("card text = %q, want substring %q", text, want)
 		}
+	}
+	if strings.Contains(text, "@") {
+		t.Fatalf("card text contains an email address: %q", text)
 	}
 }
 
@@ -6189,7 +6192,7 @@ func TestCmdUsage_LocalizedChinese(t *testing.T) {
 	}
 	got := p.sent[0]
 	for _, want := range []string{
-		"账号：dev@example.com (team)",
+		"账号：d*** (team)",
 		"5小时限额",
 		"剩余：77%",
 		"重置：1小时 51分钟",

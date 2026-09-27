@@ -9279,6 +9279,15 @@ func accountDisplay(report *UsageReport) string {
 	} else {
 		base = "-"
 	}
+	// Messaging platforms may reject replies containing an email address.
+	// Keep a recognizable account hint without sending the address itself.
+	if local, _, hasDomain := strings.Cut(base, "@"); hasDomain {
+		if local == "" {
+			base = "***"
+		} else {
+			base = string([]rune(local)[0]) + "***"
+		}
+	}
 	if report.Plan != "" {
 		return fmt.Sprintf("%s (%s)", base, report.Plan)
 	}
