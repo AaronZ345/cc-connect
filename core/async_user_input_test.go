@@ -82,7 +82,11 @@ func TestCUJ_AsyncUserInput_CardAnswerWhileWorking(t *testing.T) {
 	s := &asyncInputSession{events: make(chan Event, 16)}
 	e := NewEngine("test", &controllableAgent{nextSession: s}, []Platform{p}, "", LangEnglish)
 	e.SetDisplayConfig(DisplayCfg{CardMode: "rich", ToolMessages: false, ThinkingMessages: false})
-	t.Cleanup(func() { e.Stop() })
+	t.Cleanup(func() {
+		if err := e.Stop(); err != nil {
+			t.Errorf("stop engine: %v", err)
+		}
+	})
 	key := "feishu:chat:user"
 	send := func(content string) {
 		e.ReceiveMessage(p, &Message{SessionKey: key, Platform: "feishu", UserID: "user", Content: content, ReplyCtx: "ctx"})
@@ -144,7 +148,11 @@ func TestCUJ_AsyncUserInput_AnswerAfterTurnCompleted(t *testing.T) {
 	p := &stubPlatformEngine{n: "plain"}
 	s := &asyncInputSession{events: make(chan Event, 16)}
 	e := NewEngine("test", &controllableAgent{nextSession: s}, []Platform{p}, "", LangEnglish)
-	t.Cleanup(func() { e.Stop() })
+	t.Cleanup(func() {
+		if err := e.Stop(); err != nil {
+			t.Errorf("stop engine: %v", err)
+		}
+	})
 	key := "plain:user"
 	send := func(content string) {
 		e.ReceiveMessage(p, &Message{SessionKey: key, Platform: "plain", UserID: "user", Content: content, ReplyCtx: "ctx"})
