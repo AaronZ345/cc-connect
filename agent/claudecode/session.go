@@ -77,8 +77,9 @@ type claudeSession struct {
 	transcriptOverride string
 
 	// ctxWindowOverride is the user-configured context window size used by
-	// the "ctx N%" indicator. When <= 0, claudeContextWindow falls back to
-	// a model-name heuristic (200K, 1M for [1m] variants). The Agent sets
+	// the "ctx N%" indicator. When > 0 it wins over reportedCtxWindow; when
+	// <= 0, contextWindow uses reportedCtxWindow and then the model-name
+	// heuristic (200K, 1M for [1m] variants). The Agent sets
 	// this from `[projects.agent.options].context_window_tokens` at session
 	// construction time and never mutates it afterwards.
 	ctxWindowOverride int
