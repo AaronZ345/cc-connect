@@ -83,6 +83,12 @@ type claudeSession struct {
 	// construction time and never mutates it afterwards.
 	ctxWindowOverride int
 
+	// reportedCtxWindow is the context window Claude Code reported for this
+	// session's model in the most recent result event's modelUsage map.
+	// Zero until a result event carries one; until then (and on CLIs that
+	// omit the map) contextWindow falls back to the model-name heuristic.
+	reportedCtxWindow atomic.Int64
+
 	// gracefulStopTimeout is how long Close() waits for a clean exit
 	// (stdin close → Stop hooks → process exit) before escalating to
 	// SIGTERM and then SIGKILL. Default: 120s to match claude-mem's
@@ -980,8 +986,7 @@ func (cs *claudeSession) handleAssistant(raw map[string]any) {
 		input, _, cc, cr := parseClaudeUsage(usageRaw)
 		used := input + cc + cr
 		if used > 0 {
-			model := cs.GetModel()
-			window := claudeContextWindow(model, cs.ctxWindowOverride)
+			window := cs.contextWindow(cs.GetModel())
 			cs.usageMu.Lock()
 			prevOutput := 0
 			if cs.lastUsage != nil {
@@ -1165,6 +1170,15 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 		inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens = parseClaudeUsage(usage)
 	}
 
+	// The result event's modelUsage map is where Claude Code reports each
+	// model's real context window. Remember the session model's entry so this
+	// snapshot and every later one use it instead of the model-name guess,
+	// which knows nothing about models with a native 1M window and no "[1m]"
+	// suffix (claude-opus-5-5 reports contextWindow 1000000).
+	if w := claudeModelUsageContextWindow(raw, cs.GetModel()); w > 0 {
+		cs.reportedCtxWindow.Store(int64(w))
+	}
+
 	// Path 2: consult the transcript when the in-process snapshot is absent.
 	cs.usageMu.Lock()
 	haveExact := cs.lastUsage != nil && cs.usageSource == "event"
@@ -1185,14 +1199,21 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 		// aggregate — that substitution is what produced the overestimate.
 	}
 
-	if outputTokens > 0 {
-		cs.usageMu.Lock()
-		if cs.lastUsage != nil {
+	cs.usageMu.Lock()
+	if cs.lastUsage != nil {
+		// The snapshot was taken before this event (by handleAssistant, or
+		// read from the transcript tail by the model id recorded there), so
+		// on the first turn it still carries the guess. Correct it now, before
+		// EventResult makes the engine render the footer.
+		if w := cs.knownContextWindow(); w > 0 {
+			cs.lastUsage.ContextWindow = w
+		}
+		if outputTokens > 0 {
 			cs.lastUsage.OutputTokens = outputTokens
 			cs.lastUsage.TotalTokens = cs.lastUsage.UsedTokens + outputTokens
 		}
-		cs.usageMu.Unlock()
 	}
+	cs.usageMu.Unlock()
 
 	evt := core.Event{
 		Type:                     core.EventResult,
@@ -1669,6 +1690,68 @@ func shellJoinArgs(args []string) string {
 		b.WriteByte('\'')
 	}
 	return b.String()
+}
+
+// contextWindow returns the window the "ctx N%" indicator divides by: the
+// configured override, then the size Claude Code reported for this session's
+// model, then the model-name heuristic applied to model.
+func (cs *claudeSession) contextWindow(model string) int {
+	if w := cs.knownContextWindow(); w > 0 {
+		return w
+	}
+	return claudeContextWindow(model, 0)
+}
+
+// knownContextWindow returns the window that needs no guessing — the
+// configured context_window_tokens override, else the size Claude Code
+// reported in a result event's modelUsage — or 0 when neither is available.
+// The override wins because it is an explicit operator choice.
+func (cs *claudeSession) knownContextWindow() int {
+	if cs.ctxWindowOverride > 0 {
+		return cs.ctxWindowOverride
+	}
+	return int(cs.reportedCtxWindow.Load())
+}
+
+// claudeModelUsageContextWindow returns the contextWindow that a result
+// event's modelUsage map reports for model, or 0 when it reports none.
+//
+// The map has one entry per model the turn used, keyed by the id the init
+// event reports ("claude-opus-5-5", "claude-sonnet-5-5[1m]"). A turn that ran
+// a subagent on another model therefore carries that model's entry too, and
+// its window can differ from the session's. Only the session model's entry
+// counts: when model is known but absent from the map the answer is 0, never
+// whichever other entry happens to be there. A sole entry is taken only while
+// the session model is still unknown.
+func claudeModelUsageContextWindow(raw map[string]any, model string) int {
+	byModel, _ := raw["modelUsage"].(map[string]any)
+	if len(byModel) == 0 {
+		return 0
+	}
+	windowOf := func(v any) int {
+		entry, _ := v.(map[string]any)
+		if w := asInt(entry["contextWindow"]); w > 0 {
+			return w
+		}
+		return 0
+	}
+	if model == "" {
+		if len(byModel) == 1 {
+			for _, v := range byModel {
+				return windowOf(v)
+			}
+		}
+		return 0
+	}
+	if v, ok := byModel[model]; ok {
+		return windowOf(v)
+	}
+	for k, v := range byModel {
+		if strings.EqualFold(k, model) {
+			return windowOf(v)
+		}
+	}
+	return 0
 }
 
 // claudeContextWindow returns the context window size (tokens) that best
