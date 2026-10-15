@@ -3432,6 +3432,17 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		channelKey:        msg.ChannelKey,
 		userMessageTimeMs: msg.UserMessageTimeMs,
 	})
+	// A queued message is still the user talking: restart the
+	// reset_on_idle_mins clock now, as the idle path does, or the next
+	// message is measured from the last one that found the session idle
+	// and can be rotated into a new session mid-conversation. Timer, cron
+	// and heartbeat turns never get here (they fail fast on a busy
+	// session), so #1115 still holds. busySession is nil only while the
+	// agent is still starting, right after the message that started it
+	// was counted.
+	if state.busySession != nil {
+		state.busySession.TouchUserActivity()
+	}
 	runMessageAccepted(msg)
 	queueDepth := len(state.pendingMessages)
 

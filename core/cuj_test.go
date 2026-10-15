@@ -1447,7 +1447,7 @@ func TestCUJ_B8_HistoryShowsConversation(t *testing.T) {
 // a fresh session (already covered by TestHandleMessage_AutoResetOnIdle in
 // engine_test.go; we add a thin CUJ-level link).
 func TestCUJ_B10_ResetOnIdle_LinkedToEngineTest(t *testing.T) {
-	t.Log("CUJ-B10: see TestHandleMessage_AutoResetOnIdle_RotatesToNewSession in engine_test.go — full behavior already locked down")
+	t.Log("CUJ-B10: see TestHandleMessage_AutoResetOnIdle_RotatesToNewSession in engine_test.go and TestHandleMessage_QueuedUserMessageRefreshesIdleTimer in idle_reset_queue_test.go — full behavior already locked down")
 }
 
 // CUJ-B11 · Same user in private chat vs group chat: sessions isolated.
