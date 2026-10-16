@@ -210,11 +210,13 @@ func New(opts map[string]any) (core.Agent, error) {
 		}
 	}
 
-	// context_window_tokens overrides the model-name heuristic used by
-	// the "ctx N%" indicator. Defaults to 0 (= heuristic), accepting the
-	// same numeric types as max_context_tokens because config parsers
-	// surface integer fields through one of these shapes depending on
-	// the source (TOML → float64, programmatic → int / int64).
+	// context_window_tokens overrides the window used by the "ctx N%"
+	// indicator, ahead of both the value Claude Code reports in modelUsage
+	// and the model-name heuristic. Defaults to 0 (= reported value, else
+	// heuristic), accepting the same numeric types as max_context_tokens
+	// because config parsers surface integer fields through one of these
+	// shapes depending on the source (TOML → float64, programmatic → int /
+	// int64).
 	contextWindowTokens := 0
 	switch v := opts["context_window_tokens"].(type) {
 	case int:
