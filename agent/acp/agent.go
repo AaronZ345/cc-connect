@@ -254,7 +254,11 @@ func (a *Agent) Stop() error { return nil }
 // For non-Kimi backends this reports "session not found", which the engine
 // surfaces as an ordinary lookup failure.
 func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int) ([]core.HistoryEntry, error) {
-	return kimi.ReadSessionHistory(sessionID, limit)
+	a.mu.RLock()
+	extra := append([]string(nil), a.extraEnv...)
+	extra = append(extra, a.sessionEnv...)
+	a.mu.RUnlock()
+	return kimi.ReadSessionHistory(sessionID, limit, extra...)
 }
 
 var _ core.HistoryProvider = (*Agent)(nil)
