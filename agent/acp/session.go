@@ -223,6 +223,14 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 		case initOut.AgentCapabilities.LoadSession:
 			resumeMethod = "session/load"
 		}
+		// Both resume methods may replay conversation history the way
+		// `session/load` does, and a long replay can fill the bounded
+		// events channel and stall the transport read loop. PR #2038
+		// addresses that with a `replaying` guard on acpSession; it is
+		// not merged yet, so this call site cannot set the flag. When
+		// that guard lands it has to cover this path too, otherwise
+		// servers advertising `resume` reintroduce the deadlock #2038
+		// was written to fix.
 		if resumeMethod != "" {
 			resumeRes, err := s.tr.call(s.ctx, resumeMethod, map[string]any{
 				"sessionId":  resumeSessionID,
@@ -237,7 +245,14 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 					SessionID string         `json:"sessionId"`
 					Modes     *acpModesBlock `json:"modes"`
 				}
-				_ = json.Unmarshal(resumeRes, &rr)
+				if uerr := json.Unmarshal(resumeRes, &rr); uerr != nil {
+					// The body is allowed to be a configOptions-only
+					// object, but a malformed one is worth a trace: we
+					// adopt the requested id regardless, so this line is
+					// the only evidence it happened.
+					slog.Debug("acp: parse resume result failed, keeping requested session id",
+						"method", resumeMethod, "error", uerr)
+				}
 				// A successful resume acknowledges the id we asked for.
 				// Servers may echo it back, but some (e.g. servers that
 				// only return configOptions) omit it - adopting the
