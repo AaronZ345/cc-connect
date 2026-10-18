@@ -849,6 +849,7 @@ function CCSwitchImportModal({
   onImported: () => void;
   t: (key: string, opts?: any) => string;
 }) {
+  const { i18n } = useTranslation();
   const [providers, setProviders] = useState<CCSwitchProvider[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -888,7 +889,7 @@ function CCSwitchImportModal({
     setImportError('');
     setImporting(true);
     try {
-      const res = await importCCSwitchProviders([...selected]);
+      const res = await importCCSwitchProviders([...selected], i18n.language);
       setResult(res);
       onImported();
     } catch (e: any) {

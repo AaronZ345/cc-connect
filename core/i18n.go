@@ -259,6 +259,7 @@ const (
 	MsgNameUsage                 MsgKey = "name_usage"
 	MsgNameSet                   MsgKey = "name_set"
 	MsgNameNoSession             MsgKey = "name_no_session"
+	MsgCCSwitchAmbiguousProvider MsgKey = "cc_switch_ambiguous_provider"
 	MsgProviderNotSupported      MsgKey = "provider_not_supported"
 	MsgProviderNone              MsgKey = "provider_none"
 	MsgProviderCurrent           MsgKey = "provider_current"
@@ -1538,6 +1539,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "❌ 沒有活躍會話，請先傳送訊息或切換到一個會話。",
 		LangJapanese:           "❌ アクティブなセッションがありません。メッセージを送信するかセッションに切り替えてください。",
 		LangSpanish:            "❌ No hay sesión activa. Envía un mensaje primero o cambia a una sesión.",
+	},
+	MsgCCSwitchAmbiguousProvider: {
+		LangEnglish:            "ambiguous cc-switch provider name %q: multiple source providers match",
+		LangChinese:            "cc-switch 中的服务商名称 %q 不明确：存在多个同名来源服务商",
+		LangTraditionalChinese: "cc-switch 中的服務商名稱 %q 不明確：存在多個同名來源服務商",
+		LangJapanese:           "cc-switch のプロバイダー名 %q が曖昧です：同名のプロバイダーが複数存在します",
+		LangSpanish:            "El nombre del proveedor de cc-switch %q es ambiguo: coinciden varios proveedores de origen",
 	},
 	MsgProviderNotSupported: {
 		LangEnglish:            "This agent does not support provider switching.",

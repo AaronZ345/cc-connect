@@ -139,10 +139,59 @@ func TestMgmt_CCSwitchImport_PreservesSkippedResults(t *testing.T) {
 	}
 }
 
+// The dashboard language is independent of project settings. Failed imports
+// must be localized without changing the selection or writing any providers.
+func TestMgmt_CCSwitchImport_LocalizedErrorAndRetry(t *testing.T) {
+	for _, tt := range []struct {
+		language string
+		want     string
+	}{
+		{"en", `ambiguous cc-switch provider name "shared": multiple source providers match`},
+		{"zh", `cc-switch 中的服务商名称 "shared" 不明确：存在多个同名来源服务商`},
+		{"zh-TW", `cc-switch 中的服務商名稱 "shared" 不明確：存在多個同名來源服務商`},
+		{"ja", `cc-switch のプロバイダー名 "shared" が曖昧です：同名のプロバイダーが複数存在します`},
+		{"es", `El nombre del proveedor de cc-switch "shared" es ambiguo: coinciden varios proveedores de origen`},
+		{"", `ambiguous cc-switch provider name "shared": multiple source providers match`},
+		{"unknown", `ambiguous cc-switch provider name "shared": multiple source providers match`},
+	} {
+		t.Run(tt.language, func(t *testing.T) {
+			mgmt := NewManagementServer(0, "synthetic-token", nil)
+			mgmt.SetListCCSwitchProviders(func() ([]CCSwitchProviderInfo, error) {
+				return []CCSwitchProviderInfo{{Name: "unique"}, {Name: "shared", AppType: "claude"}, {Name: "shared", AppType: "codex"}}, nil
+			})
+			var writes []string
+			mgmt.SetAddGlobalProvider(func(p GlobalProviderInfo) error {
+				writes = append(writes, p.Name)
+				return nil
+			})
+			response, status := postCCSwitchImportLanguage(t, mgmt, []string{"unique", "shared"}, tt.language)
+			if status != http.StatusBadRequest || response.OK || response.Error != tt.want {
+				t.Fatalf("status = %d, response = %+v; want localized rejection %q", status, response, tt.want)
+			}
+			if len(writes) != 0 {
+				t.Fatalf("rejected import wrote providers: %v", writes)
+			}
+			response, status = postCCSwitchImportLanguage(t, mgmt, []string{"unique"}, tt.language)
+			if status != http.StatusOK || !response.OK || !reflect.DeepEqual(writes, []string{"unique"}) {
+				t.Fatalf("retry: status = %d, response = %+v, writes = %v", status, response, writes)
+			}
+		})
+	}
+}
+
 // Exercise production routing and authentication without opening a listener.
 func postCCSwitchImport(t *testing.T, mgmt *ManagementServer, names []string) (mgmtResponse, int) {
 	t.Helper()
-	body, err := json.Marshal(map[string]any{"names": names})
+	return postCCSwitchImportLanguage(t, mgmt, names, "")
+}
+
+func postCCSwitchImportLanguage(t *testing.T, mgmt *ManagementServer, names []string, language string) (mgmtResponse, int) {
+	t.Helper()
+	bodyFields := map[string]any{"names": names}
+	if language != "" {
+		bodyFields["language"] = language
+	}
+	body, err := json.Marshal(bodyFields)
 	if err != nil {
 		t.Fatal(err)
 	}
