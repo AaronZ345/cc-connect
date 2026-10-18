@@ -340,6 +340,8 @@ const (
 	MsgModelCardSwitched     MsgKey = "model_card_switched"
 	MsgModelCardSwitchFailed MsgKey = "model_card_switch_failed"
 	MsgModelNotSupported     MsgKey = "model_not_supported"
+	MsgModelSwitchSession    MsgKey = "model_switch_session"
+	MsgModelSwitchResponse   MsgKey = "model_switch_response"
 	MsgReasoningCurrent      MsgKey = "reasoning_current"
 	MsgReasoningChanged      MsgKey = "reasoning_changed"
 	MsgReasoningNotSupported MsgKey = "reasoning_not_supported"
@@ -2296,6 +2298,20 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "模型已切換為 `%s`。",
 		LangJapanese:           "モデルを `%s` に切り替えました。",
 		LangSpanish:            "Modelo cambiado a `%s`.",
+	},
+	MsgModelSwitchSession: {
+		LangEnglish:            "⚠️ `%[1]s`'s safeguards declined this request%[2]s, so `%[3]s` is answering instead and the rest of this session stays on it. Send `/model %[1]s` to switch back.",
+		LangChinese:            "⚠️ `%[1]s` 的安全机制拦下了这条请求%[2]s，改由 `%[3]s` 回答，本会话后面也会一直用它。发送 `/model %[1]s` 可切回。",
+		LangTraditionalChinese: "⚠️ `%[1]s` 的安全機制攔下了這條請求%[2]s，改由 `%[3]s` 回答，本會話後面也會一直使用它。傳送 `/model %[1]s` 可切回。",
+		LangJapanese:           "⚠️ `%[1]s` のセーフガードがこのリクエストを拒否したため%[2]s、`%[3]s` が代わりに回答しています。このセッションの残りも `%[3]s` のままです。`/model %[1]s` で元に戻せます。",
+		LangSpanish:            "⚠️ Las salvaguardas de `%[1]s` rechazaron esta solicitud%[2]s, así que `%[3]s` responde en su lugar y el resto de esta sesión seguirá con él. Envía `/model %[1]s` para volver.",
+	},
+	MsgModelSwitchResponse: {
+		LangEnglish:            "⚠️ `%[1]s`'s safeguards declined part of this turn%[2]s; `%[3]s` answered that part instead. The session model is unchanged.",
+		LangChinese:            "⚠️ `%[1]s` 的安全机制拦下了本轮的一部分请求%[2]s，那部分改由 `%[3]s` 回答；会话模型不变。",
+		LangTraditionalChinese: "⚠️ `%[1]s` 的安全機制攔下了本輪的一部分請求%[2]s，那部分改由 `%[3]s` 回答；會話模型不變。",
+		LangJapanese:           "⚠️ `%[1]s` のセーフガードがこのターンの一部を拒否したため%[2]s、その部分は `%[3]s` が回答しました。セッションのモデルは変わりません。",
+		LangSpanish:            "⚠️ Las salvaguardas de `%[1]s` rechazaron parte de este turno%[2]s; `%[3]s` respondió esa parte. El modelo de la sesión no cambia.",
 	},
 	MsgModelCardSwitchFailed: {
 		LangEnglish:            "Failed to switch model: %v",

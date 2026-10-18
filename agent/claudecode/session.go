@@ -48,6 +48,10 @@ type claudeSession struct {
 	// carried a model field yet; callers should fall back to the Agent's
 	// configured model.
 	activeModel atomic.Value // stores string
+	// lastModelSwitch remembers the last model_refusal_fallback that was
+	// reported, so a fallback the CLI announces twice (provisional, then final)
+	// reaches the user once.
+	lastModelSwitch atomic.Value // stores string
 
 	// usageMu guards lastUsage. Populated from the most recent result event.
 	usageMu   sync.Mutex
@@ -690,6 +694,9 @@ func (cs *claudeSession) handleSystem(raw map[string]any) {
 	if model, ok := raw["model"].(string); ok && model != "" {
 		cs.activeModel.Store(model)
 	}
+	if subtype, _ := raw["subtype"].(string); subtype == "model_refusal_fallback" {
+		cs.handleRefusalFallback(raw)
+	}
 	if sid, ok := raw["session_id"].(string); ok && sid != "" {
 		cs.sessionID.Store(sid)
 		evt := core.Event{Type: core.EventText, SessionID: sid}
@@ -716,6 +723,63 @@ func (cs *claudeSession) handleSystem(raw map[string]any) {
 			cs.usageMu.Unlock()
 		}
 	})
+}
+
+// handleRefusalFallback handles Claude Code's model_refusal_fallback event:
+// the primary model's safeguards declined a request and the CLI re-ran it on a
+// fallback model (claude-opus-5-5 falls back to claude-opus-4-8 for the "cyber"
+// category, for example). With scope "session", or no scope from older CLIs,
+// the CLI keeps the rest of the session on the fallback model until a model is
+// picked again, so the active model follows it; the reply footer would
+// otherwise keep naming a model that no longer answers. Scope "local" means
+// only a subagent's or side question's response came from the fallback model.
+//
+// The CLI may announce one fallback twice (a provisional notice mid-turn and
+// the final one at the end of the turn), so it is reported once per refused
+// request and fallback target.
+func (cs *claudeSession) handleRefusalFallback(raw map[string]any) {
+	// "revert" and "sticky" are still in the CLI's enum for SDK compatibility
+	// but are no longer emitted; only a retry moves the turn to another model.
+	if direction, _ := raw["direction"].(string); direction != "" && direction != "retry" {
+		slog.Debug("claudeSession: ignoring model_refusal_fallback", "direction", direction)
+		return
+	}
+	from, _ := raw["original_model"].(string)
+	to, _ := raw["fallback_model"].(string)
+	if from == "" || to == "" {
+		return
+	}
+	scope, _ := raw["scope"].(string)
+	sessionWide := scope != "local"
+	category, _ := raw["api_refusal_category"].(string)
+	requestID, _ := raw["request_id"].(string)
+
+	key := requestID + "\x00" + from + "\x00" + to
+	if prev, _ := cs.lastModelSwitch.Load().(string); prev == key {
+		return
+	}
+	cs.lastModelSwitch.Store(key)
+
+	if sessionWide {
+		cs.activeModel.Store(to)
+		// The cached window was reported for the previous model; the next
+		// result event reports the fallback model's own.
+		cs.reportedCtxWindow.Store(0)
+	}
+	slog.Warn("claudeSession: safeguards fallback switched model",
+		"from", from, "to", to, "category", category, "scope", scope, "request_id", requestID)
+
+	evt := core.Event{Type: core.EventModelSwitch, ModelSwitch: &core.ModelSwitch{
+		From:        from,
+		To:          to,
+		Reason:      "refusal",
+		Category:    category,
+		SessionWide: sessionWide,
+	}}
+	select {
+	case cs.events <- evt:
+	case <-cs.ctx.Done():
+	}
 }
 
 // claudeUsageFromTranscriptLine parses one JSONL transcript line and returns

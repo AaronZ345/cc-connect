@@ -5073,6 +5073,9 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 					"session", sessionKey,
 					"status", event.ToolStatus)
 
+			case EventModelSwitch:
+				e.relayModelSwitch(p, replyCtx, sessionKey, event.ModelSwitch)
+
 			case EventResult:
 				fullResponse := event.Content
 				if fullResponse == "" && len(textParts) > 0 {
@@ -5175,6 +5178,42 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 			}
 		}
 	}
+}
+
+// modelSwitchNotice renders the user-facing notice for an EventModelSwitch, or
+// "" when the event names no actual change of model.
+func (e *Engine) modelSwitchNotice(ms *ModelSwitch) string {
+	if ms == nil || ms.From == "" || ms.To == "" || ms.From == ms.To {
+		return ""
+	}
+	category := ""
+	if ms.Category != "" {
+		category = " [" + ms.Category + "]"
+	}
+	key := MsgModelSwitchResponse
+	if ms.SessionWide {
+		key = MsgModelSwitchSession
+	}
+	return e.i18n.Tf(key, ms.From, category, ms.To)
+}
+
+// relayModelSwitch tells the user that the agent moved to another model on its
+// own. Without it the reply footer is the only place the new model shows up,
+// and a session that quietly continues on a weaker model looks like a quality
+// regression rather than a deliberate fallback.
+func (e *Engine) relayModelSwitch(p Platform, replyCtx any, sessionKey string, ms *ModelSwitch) {
+	notice := e.modelSwitchNotice(ms)
+	if notice == "" {
+		return
+	}
+	slog.Warn("agent switched model on its own",
+		"session", sessionKey,
+		"from", ms.From,
+		"to", ms.To,
+		"reason", ms.Reason,
+		"category", ms.Category,
+		"session_wide", ms.SessionWide)
+	e.send(p, replyCtx, notice)
 }
 
 type agentErrorHandler struct {
@@ -5437,6 +5476,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		}
 
 		switch event.Type {
+		case EventModelSwitch:
+			e.relayModelSwitch(p, replyCtx, sessionKey, event.ModelSwitch)
+
 		case EventHookRejected:
 			// Claude Code emits this between a Stop-hook-rejected draft and its
 			// rewritten answer. Discard only per-segment assistant text state so
