@@ -1496,19 +1496,31 @@ func (cs *claudeSession) transcriptPath() string {
 	if sessionID == "" || cs.workDir == "" {
 		return ""
 	}
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
+	// Resolve the config home from the session process env so a per-project
+	// CLAUDE_CONFIG_DIR lands on the right projects tree; cmd may be nil for
+	// externally-attached sessions, in which case we fall back to ~/.claude.
+	configHome := configHomeFromEnv(cs.cmdEnv())
+	if configHome == "" {
 		return ""
 	}
 	absWorkDir, err := filepath.Abs(cs.workDir)
 	if err != nil {
 		return ""
 	}
-	projectDir := findProjectDir(homeDir, absWorkDir)
+	projectDir := findProjectDir(configHome, absWorkDir)
 	if projectDir == "" {
 		return ""
 	}
 	return filepath.Join(projectDir, sessionID+".jsonl")
+}
+
+// cmdEnv returns the environment of the underlying claude process (empty
+// when the process is not available).
+func (cs *claudeSession) cmdEnv() []string {
+	if cs.cmd == nil || cs.cmd.Env == nil {
+		return nil
+	}
+	return cs.cmd.Env
 }
 
 // GetModel returns the model id reported by the CLI's init event (e.g.
