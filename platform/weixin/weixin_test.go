@@ -802,3 +802,102 @@ func TestSendSingleItem_PushRespectsBudget(t *testing.T) {
 		t.Fatalf("push budget counter = %d, want 1", got)
 	}
 }
+
+// newBudgetTestPlatform builds a Platform the way the config loader does (default
+// burst_limit / burst_window_secs) against a fake ilink gateway, and counts the
+// sendmessage requests that reach it.
+func newBudgetTestPlatform(t *testing.T) (*Platform, *atomic.Int32) {
+	t.Helper()
+	resetPushBudgetExceededCounter()
+	var sendCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/ilink/bot/sendmessage") {
+			sendCalls.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ret":0}`))
+	}))
+	t.Cleanup(srv.Close)
+	p, err := New(map[string]any{"token": "t", "base_url": srv.URL})
+	if err != nil {
+		t.Fatalf("New error = %v", err)
+	}
+	return p.(*Platform), &sendCalls
+}
+
+// inboundText delivers one user text message through dispatchInbound and
+// returns the core.Message the engine would receive.
+func inboundText(t *testing.T, p *Platform, from string, id int64, text string) *core.Message {
+	t.Helper()
+	var got *core.Message
+	p.dispatchInbound(context.Background(), &weixinMessage{
+		MessageType:  messageTypeUser,
+		FromUserID:   from,
+		MessageID:    id,
+		CreateTimeMs: time.Now().UnixMilli(),
+		ContextToken: fmt.Sprintf("ctx-%d", id),
+		ItemList:     []messageItem{{Type: messageItemText, TextItem: &textItem{Text: text}}},
+	}, func(_ core.Platform, m *core.Message) { got = m })
+	if got == nil {
+		t.Fatalf("message %d did not reach the handler", id)
+	}
+	return got
+}
+
+// TestSend_TurnRepliesBypassPushBudget is the regression test for #1937: the
+// engine delivers each turn's answer with Platform.Send and the reply context of
+// the inbound message (core/engine.go sendAlreadyRenderedWithError), not with
+// Platform.Reply. Before the fix every such answer was charged to the push
+// budget, so with the default burst_limit = 4 the fifth answer of an ordinary
+// question-and-answer chat failed with "push budget exhausted".
+func TestSend_TurnRepliesBypassPushBudget(t *testing.T) {
+	p, sendCalls := newBudgetTestPlatform(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const rounds = 8 // twice the default burst_limit
+	for i := 1; i <= rounds; i++ {
+		msg := inboundText(t, p, "user-1", int64(i), fmt.Sprintf("question %d", i))
+		if err := p.Send(ctx, msg.ReplyCtx, fmt.Sprintf("answer %d", i)); err != nil {
+			t.Fatalf("round %d: answer to the user's message was not sent: %v", i, err)
+		}
+	}
+	if got := sendCalls.Load(); got != rounds {
+		t.Fatalf("sendmessage calls = %d, want %d (one per answer)", got, rounds)
+	}
+	if got := PushBudgetExceededTotal(); got != 0 {
+		t.Fatalf("push budget counter = %d, want 0 (answers to user messages are replies)", got)
+	}
+}
+
+// TestSend_ReconstructedReplyCtxStillCountsAsPush guards the other half: cron,
+// timer and relay sends rebuild their reply context from the stored
+// context_token (ReconstructReplyCtx). Those are proactive pushes and must stay
+// on the push budget, which is what protects the bot from ilink's ret=-2
+// throttle (#1643).
+func TestSend_ReconstructedReplyCtxStillCountsAsPush(t *testing.T) {
+	p, sendCalls := newBudgetTestPlatform(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	msg := inboundText(t, p, "user-1", 1, "hello")
+	rc, err := p.ReconstructReplyCtx(msg.SessionKey)
+	if err != nil {
+		t.Fatalf("ReconstructReplyCtx error = %v", err)
+	}
+	for i := 1; i <= defaultBurstLimit; i++ {
+		if err := p.Send(ctx, rc, fmt.Sprintf("push %d", i)); err != nil {
+			t.Fatalf("push %d of %d was blocked early: %v", i, defaultBurstLimit, err)
+		}
+	}
+	err = p.Send(ctx, rc, "one push too many")
+	if err == nil || !strings.Contains(err.Error(), "push budget exhausted") {
+		t.Fatalf("push %d error = %v, want push budget exhausted", defaultBurstLimit+1, err)
+	}
+	if got := sendCalls.Load(); got != defaultBurstLimit {
+		t.Fatalf("sendmessage calls = %d, want %d (the over-budget push must not reach the API)", got, defaultBurstLimit)
+	}
+	if got := PushBudgetExceededTotal(); got != 1 {
+		t.Fatalf("push budget counter = %d, want 1", got)
+	}
+}
