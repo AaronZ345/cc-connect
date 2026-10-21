@@ -14537,7 +14537,7 @@ func TestUnsolicitedReader_FlushesPartialTextOnCancel(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	sess := newControllableSession("unsol-flush")
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
-	defer e.Stop()
+	defer func() { _ = e.Stop() }()
 
 	sessions := e.sessions
 	session := sessions.GetOrCreateActive("test:ch1:u1")
