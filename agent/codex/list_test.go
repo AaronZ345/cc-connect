@@ -316,3 +316,88 @@ func TestParseCodexTimestamp_PreservesZeroForInvalidInput(t *testing.T) {
 		t.Fatalf("invalid timestamp = %v, want zero", got)
 	}
 }
+
+func TestAgentListSessions_DeduplicatesRolloutSegmentsBySessionID(t *testing.T) {
+	workDir := t.TempDir()
+	codexHome := t.TempDir()
+	sessionsDir := filepath.Join(codexHome, "sessions", "2026", "10", "19")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatalf("create sessions directory: %v", err)
+	}
+
+	workDirJSON, err := json.Marshal(workDir)
+	if err != nil {
+		t.Fatalf("encode work directory: %v", err)
+	}
+
+	const sessionID = "01a14f62-b1f9-75a0-9c37-058b03ddc788"
+	writeRollout := func(name, prompt string, modifiedAt time.Time) {
+		t.Helper()
+		path := filepath.Join(sessionsDir, name)
+		body := `{"type":"session_meta","payload":{"id":"` + sessionID + `","cwd":` + string(workDirJSON) + `,"source":"vscode"}}` + "\n" +
+			`{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"` + prompt + `"}]}}` + "\n"
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("write rollout %s: %v", name, err)
+		}
+		if err := os.Chtimes(path, modifiedAt, modifiedAt); err != nil {
+			t.Fatalf("set rollout time %s: %v", name, err)
+		}
+	}
+
+	older := time.Date(2026, 10, 18, 22, 20, 30, 0, time.Local)
+	newer := time.Date(2026, 10, 19, 10, 25, 44, 0, time.Local)
+	writeRollout("rollout-old.jsonl", "older segment prompt", older)
+	writeRollout("rollout-new.jsonl", "latest segment prompt", newer)
+
+	agent := &Agent{workDir: workDir, codexHome: codexHome}
+	sessions, err := agent.ListSessions(context.Background())
+	if err != nil {
+		t.Fatalf("ListSessions() error: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("ListSessions() returned %d sessions, want one logical session", len(sessions))
+	}
+	if sessions[0].ID != sessionID {
+		t.Fatalf("ListSessions()[0].ID = %q, want %q", sessions[0].ID, sessionID)
+	}
+	if sessions[0].Summary != "older segment prompt" {
+		t.Fatalf("ListSessions()[0].Summary = %q, want earliest segment prompt", sessions[0].Summary)
+	}
+	if !sessions[0].ModifiedAt.Equal(newer) {
+		t.Fatalf("ListSessions()[0].ModifiedAt = %v, want %v", sessions[0].ModifiedAt, newer)
+	}
+}
+
+func TestAgentListSessions_UsesFirstUserPromptWhenIndexTitleMissing(t *testing.T) {
+	workDir := t.TempDir()
+	codexHome := t.TempDir()
+	sessionsDir := filepath.Join(codexHome, "sessions", "2026", "10", "19")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatalf("create sessions directory: %v", err)
+	}
+
+	workDirJSON, err := json.Marshal(workDir)
+	if err != nil {
+		t.Fatalf("encode work directory: %v", err)
+	}
+
+	const sessionID = "01a15201-8ac5-7e41-8433-faa725ed555e"
+	rollout := `{"type":"session_meta","payload":{"id":"` + sessionID + `","cwd":` + string(workDirJSON) + `,"source":"vscode"}}` + "\n" +
+		`{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"第一句稳定标题"}]}}` + "\n" +
+		`{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"后来补充的问题不应覆盖标题"}]}}` + "\n"
+	if err := os.WriteFile(filepath.Join(sessionsDir, "rollout-session.jsonl"), []byte(rollout), 0o644); err != nil {
+		t.Fatalf("write rollout: %v", err)
+	}
+
+	agent := &Agent{workDir: workDir, codexHome: codexHome}
+	sessions, err := agent.ListSessions(context.Background())
+	if err != nil {
+		t.Fatalf("ListSessions() error: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("ListSessions() returned %d sessions, want 1", len(sessions))
+	}
+	if sessions[0].Summary != "第一句稳定标题" {
+		t.Fatalf("ListSessions()[0].Summary = %q, want first user prompt", sessions[0].Summary)
+	}
+}

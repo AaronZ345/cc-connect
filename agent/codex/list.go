@@ -64,7 +64,12 @@ func listCodexSessions(workDir, codexHome string) ([]core.AgentSessionInfo, erro
 	}
 
 	sessionTitles := loadCodexSessionTitles(codexHome)
-	var sessions []core.AgentSessionInfo
+	type sessionAggregate struct {
+		info           core.AgentSessionInfo
+		firstSummaryAt time.Time
+		hasSummary     bool
+	}
+	sessionsByID := make(map[string]sessionAggregate)
 	for _, f := range files {
 		info := parseCodexSessionFile(f, absWorkDir)
 		if info != nil {
@@ -75,8 +80,27 @@ func listCodexSessions(workDir, codexHome string) ([]core.AgentSessionInfo, erro
 				info.Summary = title
 			}
 			patchSessionSource(info.ID, codexHome)
-			sessions = append(sessions, *info)
+			// Codex can split one logical session across multiple rollout files.
+			// Use the latest segment for time while keeping the earliest prompt as
+			// the stable fallback title.
+			previous, ok := sessionsByID[info.ID]
+			if !ok {
+				previous = sessionAggregate{info: *info}
+			} else if info.ModifiedAt.After(previous.info.ModifiedAt) {
+				previous.info.ModifiedAt = info.ModifiedAt
+				previous.info.MessageCount = info.MessageCount
+			}
+			if info.Summary != "" && (!previous.hasSummary || info.ModifiedAt.Before(previous.firstSummaryAt)) {
+				previous.info.Summary = info.Summary
+				previous.firstSummaryAt = info.ModifiedAt
+				previous.hasSummary = true
+			}
+			sessionsByID[info.ID] = previous
 		}
+	}
+	sessions := make([]core.AgentSessionInfo, 0, len(sessionsByID))
+	for _, aggregate := range sessionsByID {
+		sessions = append(sessions, aggregate.info)
 	}
 
 	sort.Slice(sessions, func(i, j int) bool {
@@ -192,12 +216,14 @@ func parseCodexSessionFile(path, filterCwd string) *core.AgentSessionInfo {
 			case "user":
 				userMsgSeen++
 				msgCount++
-				// The actual user prompt is the last user response_item
-				// (earlier ones are system/AGENTS.md instructions).
-				// Pick the last content block that looks like a real prompt.
-				for _, c := range item.Content {
-					if c.Type == "input_text" && c.Text != "" && isUserPrompt(c.Text) {
-						summary = c.Text
+				// Earlier user items can be system/AGENTS.md instructions.
+				// Keep the first real prompt so later turns do not rename the session.
+				if summary == "" {
+					for _, c := range item.Content {
+						if c.Type == "input_text" && c.Text != "" && isUserPrompt(c.Text) {
+							summary = c.Text
+							break
+						}
 					}
 				}
 			case "assistant":
