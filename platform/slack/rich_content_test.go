@@ -81,6 +81,45 @@ func TestExtractRichContent_AttachmentTextAndFields(t *testing.T) {
 	}
 }
 
+func TestExtractRichContent_MalformedOrEmptyInputReturnsEmpty(t *testing.T) {
+	for name, ev := range map[string]string{
+		"nil-equivalent empty":     ``,
+		"malformed json":           `{"blocks":[`,
+		"no blocks or attachments": `{"text":"hi"}`,
+	} {
+		var r *json.RawMessage
+		if ev != "" {
+			r = rawJSON(t, ev)
+		}
+		if got := extractRichContent(r, "1.6"); got != "" {
+			t.Fatalf("%s: expected empty, got %q", name, got)
+		}
+	}
+}
+
+// An attachment with nothing renderable (e.g. a bare link unfurl stub) must not
+// add an empty "[Attachment N]" label to the agent's input.
+func TestExtractRichContent_EmptyAttachmentAddsNoLabel(t *testing.T) {
+	ev := `{"text":"x","attachments":[{"id":1,"color":"ccc"}]}`
+	if got := extractRichContent(rawJSON(t, ev), "1.7"); got != "" {
+		t.Fatalf("expected empty, got %q", got)
+	}
+}
+
+// Plain-text mentions must reach the agent byte-for-byte unchanged.
+func TestHandleEvent_PlainMentionContentUnchanged(t *testing.T) {
+	p, got := newDedupTestPlatform(t)
+	ts := freshTS(3)
+	raw := `{"type":"app_mention","user":"U1","channel":"C1","ts":"` + ts + `","text":"<@UBOT> hello",
+	 "blocks":[{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[{"type":"text","text":"hello"}]}]}]}`
+	p.handleEvent(callbackEvent(&slackevents.AppMentionEvent{
+		User: "U1", Channel: "C1", TimeStamp: ts, Text: "<@UBOT> hello",
+	}, "app_mention", raw))
+	if len(*got) != 1 || (*got)[0].Content != "hello" {
+		t.Fatalf("plain mention content changed: %+v", *got)
+	}
+}
+
 func TestAppendRichContent(t *testing.T) {
 	if appendRichContent("a", "") != "a" || appendRichContent("", "b") != "b" || appendRichContent("a", "b") != "a\n\nb" {
 		t.Fatal("appendRichContent mismatch")
