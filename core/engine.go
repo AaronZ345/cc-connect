@@ -10887,6 +10887,17 @@ func (e *Engine) runCompress(state *interactiveState, session *Session, sessions
 // Unlike processInteractiveEvents it does NOT record history and treats
 // an empty result as success rather than "(empty response)".
 func (e *Engine) processCompressEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, p Platform, replyCtx any, unlocked *bool, auto bool, lockGen uint64) {
+	started := time.Now()
+	logCompletion := func(outcome string) {
+		slog.Info("turn complete",
+			"session", session.ID,
+			"agent_session", session.GetAgentSessionID(),
+			"compress", true,
+			"auto", auto,
+			"outcome", outcome,
+			"turn_duration", time.Since(started),
+		)
+	}
 
 	var textParts []string
 	events := state.agentSession.Events()
@@ -10906,9 +10917,11 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 
 		select {
 		case <-stopCh:
+			logCompletion("stopped")
 			return
 		case event, ok = <-events:
 			if !ok {
+				logCompletion("eof")
 				e.cleanupInteractiveState(sessionKey, state)
 				if !auto {
 					if len(textParts) > 0 {
@@ -10921,6 +10934,7 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 				return
 			}
 		case <-idleCh:
+			logCompletion("idle_timeout")
 			if !auto {
 				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "compress timed out"))
 			}
@@ -10928,10 +10942,12 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 			e.notifyDroppedQueuedMessages(state, fmt.Errorf("compress timed out"))
 			return
 		case <-e.ctx.Done():
+			logCompletion("shutdown")
 			return
 		}
 
 		if state.isStopped() {
+			logCompletion("stopped")
 			return
 		}
 
@@ -10966,6 +10982,8 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 				textParts = append(textParts, fmt.Sprintf(e.i18n.T(MsgToolResult), tn, out)+"\n")
 			}
 		case EventResult:
+			// Finish compression before draining queued turns, which may run for minutes.
+			logCompletion("result")
 			result := event.Content
 			if result == "" && len(textParts) > 0 {
 				result = strings.Join(textParts, "")
@@ -10982,6 +11000,7 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 			e.drainQueuedMessagesAfterCompress(state, session, sessions, sessionKey, unlocked, lockGen)
 			return
 		case EventError:
+			logCompletion("error")
 			if !auto && event.Error != nil {
 				e.reply(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), event.Error))
 			}
