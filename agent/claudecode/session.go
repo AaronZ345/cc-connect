@@ -677,6 +677,22 @@ func isCompactionResult(raw map[string]any) bool {
 	return resultSubtype(raw) == "compact" || resultSubtype(raw) == "compaction"
 }
 
+// isEmptyTaskNotificationResult reports whether a `type:"result"` event
+// closes a CLI-internal task-notification turn that produced no output and
+// made no model call. Such results are never a reply to a prompt sent by
+// cc-connect (see handleResult).
+func isEmptyTaskNotificationResult(raw map[string]any, content string) bool {
+	if content != "" {
+		return false
+	}
+	origin, _ := raw["origin"].(map[string]any)
+	if kind, _ := origin["kind"].(string); kind != "task-notification" {
+		return false
+	}
+	turns, ok := raw["num_turns"].(float64)
+	return ok && turns == 0
+}
+
 // resultSubtype extracts the optional `subtype` field from a result
 // event payload. Empty string when missing.
 func resultSubtype(raw map[string]any) string {
@@ -1130,6 +1146,22 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 	}
 	if sid, ok := raw["session_id"].(string); ok && sid != "" {
 		cs.sessionID.Store(sid)
+	}
+
+	// On --resume, Claude Code first replays task notifications for
+	// background shell tasks that did not finish before the previous process
+	// exited ("Background shell command didn't finish before the previous
+	// session ended"). Each one is closed with a synthetic result that has
+	// origin.kind == "task-notification", no model call (num_turns == 0) and
+	// an empty result. It is emitted right after the process starts — i.e.
+	// after cc-connect has already written the user's prompt to stdin — so
+	// forwarding it as EventResult{Done:true} makes the engine finish the
+	// user's turn with "(empty response)" and push the real reply into the
+	// unsolicited relay. It carries nothing to deliver, so drop it.
+	if isEmptyTaskNotificationResult(raw, content) {
+		slog.Info("claudeSession: dropping empty task-notification result (no model call)",
+			"session_id", cs.CurrentSessionID())
+		return
 	}
 
 	// Compaction events arrive as `type:"result"` with `subtype:"compact"`

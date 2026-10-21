@@ -14527,6 +14527,53 @@ func TestUnsolicitedReader_StopsOnCancel(t *testing.T) {
 	}
 }
 
+// TestUnsolicitedReader_FlushesPartialTextOnCancel is a regression test for
+// text being dropped when a new foreground turn cancels an unsolicited reader
+// mid-turn. Scenario (Claude Code, after a --resume): a stray result ended the
+// user's turn early, the real reply then streamed into the unsolicited reader,
+// and the user sent another message before that reply's EventResult arrived.
+// The already-streamed text must still be delivered.
+func TestUnsolicitedReader_FlushesPartialTextOnCancel(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newControllableSession("unsol-flush")
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	defer e.Stop()
+
+	sessions := e.sessions
+	session := sessions.GetOrCreateActive("test:ch1:u1")
+
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+
+	e.startUnsolicitedReader(state, session, sessions, "test:ch1:u1", "")
+
+	sess.events <- Event{Type: EventText, Content: "Here is the analysis "}
+	sess.events <- Event{Type: EventText, Content: "you asked for."}
+
+	// Wait until the reader has consumed both events.
+	deadline := time.Now().Add(2 * time.Second)
+	for len(sess.events) > 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	e.stopUnsolicitedReader(state)
+
+	sent := waitForPlatformSend(p, 1, 2*time.Second)
+	found := false
+	for _, s := range sent {
+		if strings.Contains(s, "Here is the analysis you asked for.") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected partial unsolicited text to be flushed on cancel, got %v", sent)
+	}
+}
+
 // TestUnsolicitedReader_SetsResyncOnChannelClose verifies that when the agent
 // process exits (events channel closed), eventsNeedResync is set to true.
 func TestUnsolicitedReader_SetsResyncOnChannelClose(t *testing.T) {

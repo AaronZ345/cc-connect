@@ -4990,12 +4990,49 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 	var textParts []string
 	var toolsUsed []string
 
+	// flushPartial relays text already accumulated for an unsolicited turn
+	// that will not reach its EventResult through this reader (a new
+	// foreground turn took over the Events channel, or the agent exited).
+	// Without it the text is silently discarded: e.g. the reply to a prompt
+	// whose turn was finished early by a stray result is streaming here
+	// when the user sends the next message, and would never be delivered.
+	flushPartial := func(reason string) {
+		if len(textParts) == 0 {
+			return
+		}
+		partial := strings.Join(textParts, "")
+		textParts = nil
+		if strings.TrimSpace(partial) == "" {
+			return
+		}
+		state.mu.Lock()
+		p := state.platform
+		replyCtx := state.replyCtx
+		state.mu.Unlock()
+		if p != nil {
+			// Send asynchronously: stopUnsolicitedReader waits (bounded) for
+			// this goroutine and some of its callers hold interactiveMu, so a
+			// slow platform call must not extend that wait.
+			chunks := SplitMessageCodeFenceAware(partial, maxPlatformMessageLen)
+			go func() {
+				for _, chunk := range chunks {
+					e.send(p, replyCtx, chunk)
+				}
+			}()
+		}
+		session.AddHistory("assistant", partial)
+		sessions.Save()
+		slog.Info("unsolicited reader: flushed partial turn",
+			"session", sessionKey, "reason", reason, "response_len", len(partial))
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			// Context cancelled (new foreground turn or cleanup). Don't set
 			// eventsNeedResync — the caller (stopUnsolicitedReader) knows the
 			// channel state is clean because it just took ownership.
+			flushPartial("cancelled")
 			return
 
 		case event, ok := <-events:
@@ -5008,6 +5045,7 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 						"tools_used", toolsUsed,
 						"text_fragments", len(textParts))
 				}
+				flushPartial("channel closed")
 				state.mu.Lock()
 				state.eventsNeedResync = true
 				state.mu.Unlock()
@@ -5029,6 +5067,7 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				state.mu.Lock()
 				state.eventsNeedResync = true
 				state.mu.Unlock()
+				flushPartial("cancelled")
 				return
 			default:
 			}
