@@ -3618,9 +3618,27 @@ func (e *Engine) handlePendingPermission(p Platform, msg *Message, content strin
 				"session", msg.SessionKey, "content", content)
 			return true
 		}
+		// Same for an AskUserQuestion option click that arrives after its
+		// question was answered some other way (e.g. by a chat message), or
+		// after a restart: forwarding "askq:0:1" as user input would queue
+		// it for the agent as literal text.
+		if _, _, ok := parseAskQuestionCallback(content); ok {
+			e.dropStaleAskQuestionCallback(p, msg, content)
+			return true
+		}
 		return false
 	}
 found:
+
+	// An option click from an AskUserQuestion card is never a permission
+	// decision, and a click on an earlier question's card must not answer
+	// the question being asked now.
+	if qIdx, hasQIdx, ok := parseAskQuestionCallback(content); ok {
+		if len(pending.Questions) == 0 || (hasQIdx && qIdx != pending.CurrentQuestion) {
+			e.dropStaleAskQuestionCallback(p, msg, content)
+			return true
+		}
+	}
 
 	// AskUserQuestion: interpret user response as an answer, not a permission decision
 	if len(pending.Questions) > 0 {
@@ -3730,6 +3748,40 @@ func (e *Engine) lookupPending(iKey string) (*interactiveState, *pendingPermissi
 	pending := state.pending
 	state.mu.Unlock()
 	return state, pending
+}
+
+// parseAskQuestionCallback recognizes the value an AskUserQuestion option
+// button sends back: "askq:qIdx:optIdx", or the legacy "askq:optIdx".
+// hasQIdx reports whether the question index was present. ok is false for
+// anything else, including free text that merely starts with "askq:".
+func parseAskQuestionCallback(content string) (qIdx int, hasQIdx bool, ok bool) {
+	rest, found := strings.CutPrefix(strings.TrimSpace(content), "askq:")
+	if !found {
+		return 0, false, false
+	}
+	parts := strings.Split(rest, ":")
+	for _, part := range parts {
+		if n, err := strconv.Atoi(part); err != nil || n < 0 {
+			return 0, false, false
+		}
+	}
+	switch len(parts) {
+	case 1:
+		return 0, false, true
+	case 2:
+		qIdx, _ = strconv.Atoi(parts[0])
+		return qIdx, true, true
+	}
+	return 0, false, false
+}
+
+// dropStaleAskQuestionCallback tells the user that an option click arrived
+// for a question that is no longer waiting for an answer, instead of passing
+// the click on to the agent.
+func (e *Engine) dropStaleAskQuestionCallback(p Platform, msg *Message, content string) {
+	slog.Info("dropping stale ask-question callback",
+		"session", msg.SessionKey, "content", content)
+	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgAskQuestionStale))
 }
 
 // resolveAskQuestionAnswer converts user input into answer text.

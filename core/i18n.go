@@ -457,6 +457,7 @@ const (
 	MsgAskQuestionMulti     MsgKey = "ask_question_multi"
 	MsgAskQuestionPrompt    MsgKey = "ask_question_prompt"
 	MsgAskQuestionAnswered  MsgKey = "ask_question_answered"
+	MsgAskQuestionStale     MsgKey = "ask_question_stale"
 
 	MsgCommandsTitle        MsgKey = "commands_title"
 	MsgCommandsEmpty        MsgKey = "commands_empty"
@@ -2815,6 +2816,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "已回答",
 		LangJapanese:           "回答済み",
 		LangSpanish:            "Respondido",
+	},
+	MsgAskQuestionStale: {
+		LangEnglish:            "⚠️ That question was already answered or is no longer active, so this answer was not sent to the agent.",
+		LangChinese:            "⚠️ 这个问题已经回答过了或已失效，这次的回答没有发给 agent。",
+		LangTraditionalChinese: "⚠️ 這個問題已經回答過了或已失效，這次的回答沒有發給 agent。",
+		LangJapanese:           "⚠️ この質問は回答済みか無効になっているため、この回答はエージェントに送信されませんでした。",
+		LangSpanish:            "⚠️ Esa pregunta ya se respondió o ya no está activa, así que esta respuesta no se envió al agente.",
 	},
 	MsgCommandsTitle: {
 		LangEnglish:            "🔧 **Custom Commands** (%d)\n\n",
