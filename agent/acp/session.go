@@ -43,6 +43,8 @@ type acpSession struct {
 
 	toolInputMu   sync.Mutex
 	toolInputByID map[string]string // toolCallId -> summarized tool input
+	toolNameMu    sync.Mutex
+	toolNameByID  map[toolCallKey]string
 
 	// modesMu guards availableModes and currentMode. Both fields are
 	// populated on handshake (session/new or session/load response) and
@@ -371,11 +373,15 @@ func (s *acpSession) onNotification(method string, params json.RawMessage) {
 		return
 	}
 	s.cacheToolCallInput(params)
+	toolName := s.resolveToolCallName(params)
 	s.maybeAbsorbCurrentModeUpdate(params)
 	sid := s.currentACPSessionID()
 	// Debug log to capture raw session/update JSON for troubleshooting vendor compatibility
 	slog.Debug("acp: session/update", "session_id", sid, "params", string(params))
 	for _, ev := range mapSessionUpdate(sid, params) {
+		if ev.Type == core.EventToolResult && toolName != "" {
+			ev.ToolName = toolName
+		}
 		s.emit(ev)
 	}
 }
