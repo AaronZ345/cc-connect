@@ -7,6 +7,7 @@ package slack
 // Markdown so it can be appended to the message content.
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -42,13 +43,16 @@ func extractRichContent(raw *json.RawMessage, msgID string) string {
 		return ""
 	}
 
-	if dump, err := json.Marshal(map[string]any{"blocks": ev.Blocks, "attachments": ev.Attachments}); err == nil {
-		s := string(dump)
-		if len(s) > richContentLogLimit {
-			s = s[:richContentLogLimit] + "...(truncated)"
+	// Only pay for re-marshalling the payload when debug logging is on.
+	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+		if dump, err := json.Marshal(map[string]any{"blocks": ev.Blocks, "attachments": ev.Attachments}); err == nil {
+			s := string(dump)
+			if len(s) > richContentLogLimit {
+				s = s[:richContentLogLimit] + "...(truncated)"
+			}
+			slog.Debug("slack: rich content received", "msg_id", msgID,
+				"blocks", len(ev.Blocks), "attachments", len(ev.Attachments), "raw", s)
 		}
-		slog.Debug("slack: rich content received", "msg_id", msgID,
-			"blocks", len(ev.Blocks), "attachments", len(ev.Attachments), "raw", s)
 	}
 
 	var parts []string
