@@ -585,6 +585,12 @@ type interactiveState struct {
 	// to confirm it has exited before starting a new foreground turn.
 	unsolicitedCancel context.CancelFunc // nil when no reader is running
 	unsolicitedDone   chan struct{}      // closed when the reader goroutine exits
+	// unsolicitedFlushDone is closed once any partial-turn text flushed by
+	// the exiting reader has been handed to the platform (or immediately on
+	// exit when there was nothing to flush). stopUnsolicitedReader waits on
+	// it, within the same bounded timeout, so a flushed reply is delivered
+	// before the next foreground turn's reply.
+	unsolicitedFlushDone chan struct{}
 
 	// agentSessionIdleCancel 取消当前会话的 idle 关闭计时器。
 	agentSessionIdleCancel context.CancelFunc
@@ -4901,7 +4907,10 @@ func buildCardContent(thinking string, tools []cardToolEntry, answer string) str
 const unsolicitedReaderStopTimeout = 5 * time.Second
 
 // stopUnsolicitedReader cancels any running unsolicited reader goroutine and
-// waits (bounded) for it to exit. If the reader does not exit in time, the
+// waits (bounded) for it to exit and for any partial text it flushed on exit
+// to finish sending, so that text is delivered before the next foreground
+// turn's reply. Both waits share one unsolicitedReaderStopTimeout budget.
+// If the reader does not exit in time, the
 // caller is responsible for draining/resyncing the Events channel before a
 // new foreground turn reads from it — we set eventsNeedResync here so that
 // any downstream consumer drains before resuming. We do NOT wait unbounded:
@@ -4911,8 +4920,10 @@ func (e *Engine) stopUnsolicitedReader(state *interactiveState) {
 	state.mu.Lock()
 	cancel := state.unsolicitedCancel
 	done := state.unsolicitedDone
+	flushDone := state.unsolicitedFlushDone
 	state.unsolicitedCancel = nil
 	state.unsolicitedDone = nil
+	state.unsolicitedFlushDone = nil
 	state.mu.Unlock()
 
 	if cancel == nil {
@@ -4922,9 +4933,24 @@ func (e *Engine) stopUnsolicitedReader(state *interactiveState) {
 	if done == nil {
 		return
 	}
+	timer := time.NewTimer(unsolicitedReaderStopTimeout)
+	defer timer.Stop()
 	select {
 	case <-done:
-	case <-time.After(unsolicitedReaderStopTimeout):
+		if flushDone == nil {
+			return
+		}
+		select {
+		case <-flushDone:
+		case <-timer.C:
+			// The reader has exited, so the Events channel is already owned
+			// solely by the caller and needs no resync. Only ordering is
+			// degraded: the remaining flushed chunks are still delivered in
+			// the background and may interleave with the next turn's reply.
+			slog.Warn("unsolicited reader flush still sending after stop timeout; continuing",
+				"timeout", unsolicitedReaderStopTimeout)
+		}
+	case <-timer.C:
 		slog.Warn("unsolicited reader stop timed out; forcing resync",
 			"timeout", unsolicitedReaderStopTimeout)
 		// Force the next foreground turn to drain Events() defensively.
@@ -4958,21 +4984,33 @@ func (e *Engine) startUnsolicitedReader(state *interactiveState, session *Sessio
 
 	ctx, cancel := context.WithCancel(e.ctx)
 	done := make(chan struct{})
+	flushDone := make(chan struct{})
 
 	state.mu.Lock()
 	state.unsolicitedCancel = cancel
 	state.unsolicitedDone = done
+	state.unsolicitedFlushDone = flushDone
 	state.mu.Unlock()
 
-	go e.runUnsolicitedReader(ctx, cancel, done, state, agentSession, session, sessions, sessionKey, workspaceDir)
+	go e.runUnsolicitedReader(ctx, cancel, done, flushDone, state, agentSession, session, sessions, sessionKey, workspaceDir)
 }
 
 // runUnsolicitedReader is the goroutine body for the unsolicited event reader.
 // agentSession is captured by the caller so we don't race with
 // cleanupInteractiveState nilling state.agentSession.
-func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.CancelFunc, done chan struct{}, state *interactiveState, agentSession AgentSession, session *Session, sessions *SessionManager, sessionKey string, workspaceDir string) {
+//
+// flushDone is closed exactly once: by the flush sender goroutine if a partial
+// turn was flushed on exit, otherwise when this goroutine returns.
+func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.CancelFunc, done chan struct{}, flushDone chan struct{}, state *interactiveState, agentSession AgentSession, session *Session, sessions *SessionManager, sessionKey string, workspaceDir string) {
 	defer close(done)
 	defer cancel()
+
+	flushHandedOff := false
+	defer func() {
+		if !flushHandedOff {
+			close(flushDone)
+		}
+	}()
 
 	events := agentSession.Events()
 
@@ -5010,11 +5048,16 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 		replyCtx := state.replyCtx
 		state.mu.Unlock()
 		if p != nil {
-			// Send asynchronously: stopUnsolicitedReader waits (bounded) for
-			// this goroutine and some of its callers hold interactiveMu, so a
-			// slow platform call must not extend that wait.
+			// Send off the reader goroutine and signal flushDone when finished.
+			// stopUnsolicitedReader waits for flushDone within its bounded
+			// timeout, which keeps the flushed text ahead of the next
+			// foreground turn's reply in the common case while a slow
+			// platform call can never extend that wait (some callers hold
+			// interactiveMu) beyond the bound.
 			chunks := SplitMessageCodeFenceAware(partial, maxPlatformMessageLen)
+			flushHandedOff = true
 			go func() {
+				defer close(flushDone)
 				for _, chunk := range chunks {
 					e.send(p, replyCtx, chunk)
 				}
@@ -5131,6 +5174,15 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				// takes event-channel ownership) blocks until this goroutine
 				// exits — so a foreground AddHistory is always ordered after
 				// any unsolicited AddHistory.
+				//
+				// Platform message ordering is guaranteed here because the
+				// sends above are synchronous. Partial text flushed on exit
+				// (flushPartial) is sent from a separate goroutine;
+				// stopUnsolicitedReader also waits for it via flushDone, but
+				// only within unsolicitedReaderStopTimeout. If that bound
+				// fires, flushed chunks may arrive after or interleave with
+				// the next foreground turn's reply (delivery is still
+				// guaranteed; only ordering degrades).
 				session.AddHistory("assistant", fullResponse)
 				sessions.Save()
 

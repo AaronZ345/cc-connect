@@ -14574,6 +14574,114 @@ func TestUnsolicitedReader_FlushesPartialTextOnCancel(t *testing.T) {
 	}
 }
 
+// slowSendPlatform records sends like stubPlatformEngine but takes sendDelay
+// per Send, and blocks each Send until gate is closed when gate is non-nil.
+// It widens the window in which an asynchronous flush can be overtaken.
+type slowSendPlatform struct {
+	stubPlatformEngine
+	sendDelay time.Duration
+	gate      chan struct{}
+}
+
+func (p *slowSendPlatform) Send(ctx context.Context, rc any, content string) error {
+	if p.gate != nil {
+		<-p.gate
+	}
+	time.Sleep(p.sendDelay)
+	return p.stubPlatformEngine.Send(ctx, rc, content)
+}
+
+// startUnsolicitedReaderWithPartial starts a reader and feeds it a multi-chunk
+// partial turn (no EventResult), returning once the reader has consumed it.
+func startUnsolicitedReaderWithPartial(t *testing.T, e *Engine, p Platform, key string) (*interactiveState, []string) {
+	t.Helper()
+	sess := newControllableSession(key)
+	session := e.sessions.GetOrCreateActive(key)
+	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+	e.startUnsolicitedReader(state, session, e.sessions, key, "")
+
+	line := strings.Repeat("x", 99) + "\n"
+	var partial strings.Builder
+	for i := 0; i < 3*maxPlatformMessageLen/len(line); i++ {
+		partial.WriteString(line)
+	}
+	chunks := SplitMessageCodeFenceAware(partial.String(), maxPlatformMessageLen)
+	if len(chunks) < 3 {
+		t.Fatalf("test setup: expected >= 3 chunks, got %d", len(chunks))
+	}
+	sess.events <- Event{Type: EventText, Content: partial.String()}
+	deadline := time.Now().Add(2 * time.Second)
+	for len(sess.events) > 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	return state, chunks
+}
+
+// TestUnsolicitedReader_FlushOrderedBeforeNextTurn verifies that partial text
+// flushed when a new foreground turn cancels the reader is fully delivered
+// before anything the new turn sends after stopUnsolicitedReader returns,
+// i.e. the flushed chunks are neither overtaken nor interleaved.
+func TestUnsolicitedReader_FlushOrderedBeforeNextTurn(t *testing.T) {
+	p := &slowSendPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}, sendDelay: 30 * time.Millisecond}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	defer func() { _ = e.Stop() }()
+
+	state, chunks := startUnsolicitedReaderWithPartial(t, e, p, "test:order:u1")
+
+	e.stopUnsolicitedReader(state)
+	// Simulates the next foreground turn replying right after taking over.
+	e.send(p, "ctx", "FOREGROUND-REPLY")
+
+	sent := waitForPlatformSend(&p.stubPlatformEngine, len(chunks)+1, 5*time.Second)
+	if len(sent) != len(chunks)+1 {
+		t.Fatalf("expected %d sends, got %d: %q", len(chunks)+1, len(sent), sent)
+	}
+	for i, chunk := range chunks {
+		if sent[i] != chunk {
+			t.Fatalf("send %d: flushed chunk out of order (foreground reply overtook flush); got %q", i, sent[i])
+		}
+	}
+	if sent[len(chunks)] != "FOREGROUND-REPLY" {
+		t.Fatalf("expected foreground reply last, got %q", sent[len(chunks)])
+	}
+}
+
+// TestUnsolicitedReader_FlushWaitIsBounded verifies that a platform stuck on
+// the flushed send cannot block stopUnsolicitedReader beyond
+// unsolicitedReaderStopTimeout, that no Events resync is forced (the reader
+// itself has exited), and that the flushed text is still delivered later.
+func TestUnsolicitedReader_FlushWaitIsBounded(t *testing.T) {
+	gate := make(chan struct{})
+	p := &slowSendPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}, gate: gate}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	defer func() { _ = e.Stop() }()
+
+	state, chunks := startUnsolicitedReaderWithPartial(t, e, p, "test:bounded:u1")
+
+	start := time.Now()
+	e.stopUnsolicitedReader(state)
+	elapsed := time.Since(start)
+	if elapsed > unsolicitedReaderStopTimeout+2*time.Second {
+		t.Fatalf("stopUnsolicitedReader blocked %v, want <= ~%v", elapsed, unsolicitedReaderStopTimeout)
+	}
+	if elapsed < unsolicitedReaderStopTimeout-time.Second {
+		t.Fatalf("stopUnsolicitedReader returned after %v; expected it to wait for the flush up to the timeout", elapsed)
+	}
+	state.mu.Lock()
+	resync := state.eventsNeedResync
+	state.mu.Unlock()
+	if resync {
+		t.Error("flush timeout must not force an Events resync: the reader already exited")
+	}
+
+	close(gate)
+	sent := waitForPlatformSend(&p.stubPlatformEngine, len(chunks), 5*time.Second)
+	if len(sent) != len(chunks) {
+		t.Fatalf("expected flushed chunks to be delivered after the gate opened, got %d of %d", len(sent), len(chunks))
+	}
+}
+
 // TestUnsolicitedReader_SetsResyncOnChannelClose verifies that when the agent
 // process exits (events channel closed), eventsNeedResync is set to true.
 func TestUnsolicitedReader_SetsResyncOnChannelClose(t *testing.T) {
