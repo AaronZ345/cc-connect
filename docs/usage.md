@@ -1017,6 +1017,8 @@ type = "claudecode"
 
 A full-featured management UI embedded in the binary — project CRUD, session management, cron job editor, global settings, chat interface, and i18n support.
 
+When importing providers from CC-Switch in the dashboard, an import is rejected if a selected name matches multiple source providers. No providers are added in that request. Deselect the ambiguous name to import the remaining unique providers.
+
 ### Quick Setup (Chat Command)
 
 The easiest way to enable web admin:

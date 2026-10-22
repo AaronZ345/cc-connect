@@ -2059,7 +2059,8 @@ func (m *ManagementServer) handleCCSwitchProviders(w http.ResponseWriter, r *htt
 			return
 		}
 		var body struct {
-			Names []string `json:"names"`
+			Names    []string `json:"names"`
+			Language string   `json:"language,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -2076,8 +2077,21 @@ func (m *ManagementServer) handleCCSwitchProviders(w http.ResponseWriter, r *htt
 			return
 		}
 		byName := make(map[string]CCSwitchProviderInfo, len(all))
+		ambiguous := make(map[string]bool)
 		for _, p := range all {
+			if _, exists := byName[p.Name]; exists {
+				ambiguous[p.Name] = true
+			}
 			byName[p.Name] = p
+		}
+
+		// Validate the entire selection before writing any providers. A name
+		// alone cannot identify which same-named source provider was selected.
+		for _, name := range body.Names {
+			if ambiguous[name] {
+				mgmtError(w, http.StatusBadRequest, NewI18n(NormalizeLanguageString(body.Language)).Tf(MsgCCSwitchAmbiguousProvider, name))
+				return
+			}
 		}
 
 		var imported, skipped []string
