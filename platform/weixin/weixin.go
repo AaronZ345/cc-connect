@@ -50,7 +50,9 @@ const (
 // budget can be scoped to where ilink actually throttles us (issue #1742).
 //   - sendPathReply: reactive reply to an inbound user message. The gateway
 //     does not throttle replies on interactive deployments, so the push-path
-//     budget must NOT consume them.
+//     budget must NOT consume them. This covers Reply and also Send with a
+//     reply context taken from an inbound message: the engine sends a turn's
+//     answer through Send (issue #1937).
 //   - sendPathPush: proactive push (cron / timer / file transfer / SendImage /
 //     SendFile / SendAudio). Counts against burst_limit.
 //
@@ -85,6 +87,11 @@ func resetPushBudgetExceededCounter() {
 type replyContext struct {
 	peerUserID   string
 	contextToken string
+	// inbound marks a context built from a received user message
+	// (dispatchInbound). The engine delivers a turn's answer through Send with
+	// this context, so Send uses it to tell a reply from a proactive push.
+	// Contexts rebuilt by ReconstructReplyCtx (cron, timer, relay) leave it false.
+	inbound bool
 }
 
 // Platform implements core.Platform for Weixin personal chat via the ilink bot HTTP API
@@ -583,7 +590,7 @@ func (p *Platform) dispatchInbound(ctx context.Context, m *weixinMessage, h core
 		return
 	}
 
-	rc := &replyContext{peerUserID: from, contextToken: strings.TrimSpace(m.ContextToken)}
+	rc := &replyContext{peerUserID: from, contextToken: strings.TrimSpace(m.ContextToken), inbound: true}
 	msgID := fmt.Sprintf("%d", m.MessageID)
 	if m.MessageID == 0 {
 		msgID = randomHex(8)
@@ -641,11 +648,18 @@ func (p *Platform) Reply(ctx context.Context, replyCtx any, content string) erro
 	return p.sendChunks(ctx, replyCtx, content, sendPathReply)
 }
 
-// Send proactively pushes a message to the user (cron / timer / Relay). Pushes
-// count against the burst budget because ilink DOES throttle proactive sends
-// (see #1643 / #1742).
+// Send delivers a message the engine did not route through Reply. The engine
+// uses Send for each turn's answer, passing the reply context of the user's
+// message; that is a reply and bypasses the burst budget like Reply does
+// (#1937). Every other Send — cron, timer, relay, whose reply context comes
+// from ReconstructReplyCtx — is a proactive push and counts against the budget,
+// because ilink DOES throttle proactive sends (see #1643 / #1742).
 func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error {
-	return p.sendChunks(ctx, replyCtx, content, sendPathPush)
+	path := sendPathPush
+	if rc, ok := replyCtx.(*replyContext); ok && rc != nil && rc.inbound {
+		path = sendPathReply
+	}
+	return p.sendChunks(ctx, replyCtx, content, path)
 }
 
 // StartTyping sends a typing indicator to the peer and repeats every few seconds
