@@ -48,6 +48,10 @@ type claudeSession struct {
 	// carried a model field yet; callers should fall back to the Agent's
 	// configured model.
 	activeModel atomic.Value // stores string
+	// lastModelSwitch remembers the last model_refusal_fallback that was
+	// reported, so a fallback the CLI announces twice (provisional, then final)
+	// reaches the user once.
+	lastModelSwitch atomic.Value // stores string
 
 	// usageMu guards lastUsage. Populated from the most recent result event.
 	usageMu   sync.Mutex
@@ -677,6 +681,22 @@ func isCompactionResult(raw map[string]any) bool {
 	return resultSubtype(raw) == "compact" || resultSubtype(raw) == "compaction"
 }
 
+// isEmptyTaskNotificationResult reports whether a `type:"result"` event
+// closes a CLI-internal task-notification turn that produced no output and
+// made no model call. Such results are never a reply to a prompt sent by
+// cc-connect (see handleResult).
+func isEmptyTaskNotificationResult(raw map[string]any, content string) bool {
+	if content != "" {
+		return false
+	}
+	origin, _ := raw["origin"].(map[string]any)
+	if kind, _ := origin["kind"].(string); kind != "task-notification" {
+		return false
+	}
+	turns, ok := raw["num_turns"].(float64)
+	return ok && turns == 0
+}
+
 // resultSubtype extracts the optional `subtype` field from a result
 // event payload. Empty string when missing.
 func resultSubtype(raw map[string]any) string {
@@ -689,6 +709,9 @@ func resultSubtype(raw map[string]any) string {
 func (cs *claudeSession) handleSystem(raw map[string]any) {
 	if model, ok := raw["model"].(string); ok && model != "" {
 		cs.activeModel.Store(model)
+	}
+	if subtype, _ := raw["subtype"].(string); subtype == "model_refusal_fallback" {
+		cs.handleRefusalFallback(raw)
 	}
 	if sid, ok := raw["session_id"].(string); ok && sid != "" {
 		cs.sessionID.Store(sid)
@@ -716,6 +739,63 @@ func (cs *claudeSession) handleSystem(raw map[string]any) {
 			cs.usageMu.Unlock()
 		}
 	})
+}
+
+// handleRefusalFallback handles Claude Code's model_refusal_fallback event:
+// the primary model's safeguards declined a request and the CLI re-ran it on a
+// fallback model (claude-opus-5-5 falls back to claude-opus-4-8 for the "cyber"
+// category, for example). With scope "session", or no scope from older CLIs,
+// the CLI keeps the rest of the session on the fallback model until a model is
+// picked again, so the active model follows it; the reply footer would
+// otherwise keep naming a model that no longer answers. Scope "local" means
+// only a subagent's or side question's response came from the fallback model.
+//
+// The CLI may announce one fallback twice (a provisional notice mid-turn and
+// the final one at the end of the turn), so it is reported once per refused
+// request and fallback target.
+func (cs *claudeSession) handleRefusalFallback(raw map[string]any) {
+	// "revert" and "sticky" are still in the CLI's enum for SDK compatibility
+	// but are no longer emitted; only a retry moves the turn to another model.
+	if direction, _ := raw["direction"].(string); direction != "" && direction != "retry" {
+		slog.Debug("claudeSession: ignoring model_refusal_fallback", "direction", direction)
+		return
+	}
+	from, _ := raw["original_model"].(string)
+	to, _ := raw["fallback_model"].(string)
+	if from == "" || to == "" {
+		return
+	}
+	scope, _ := raw["scope"].(string)
+	sessionWide := scope != "local"
+	category, _ := raw["api_refusal_category"].(string)
+	requestID, _ := raw["request_id"].(string)
+
+	key := requestID + "\x00" + from + "\x00" + to
+	if prev, _ := cs.lastModelSwitch.Load().(string); prev == key {
+		return
+	}
+	cs.lastModelSwitch.Store(key)
+
+	if sessionWide {
+		cs.activeModel.Store(to)
+		// The cached window was reported for the previous model; the next
+		// result event reports the fallback model's own.
+		cs.reportedCtxWindow.Store(0)
+	}
+	slog.Warn("claudeSession: safeguards fallback switched model",
+		"from", from, "to", to, "category", category, "scope", scope, "request_id", requestID)
+
+	evt := core.Event{Type: core.EventModelSwitch, ModelSwitch: &core.ModelSwitch{
+		From:        from,
+		To:          to,
+		Reason:      "refusal",
+		Category:    category,
+		SessionWide: sessionWide,
+	}}
+	select {
+	case cs.events <- evt:
+	case <-cs.ctx.Done():
+	}
 }
 
 // claudeUsageFromTranscriptLine parses one JSONL transcript line and returns
@@ -1132,6 +1212,22 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 		cs.sessionID.Store(sid)
 	}
 
+	// On --resume, Claude Code first replays task notifications for
+	// background shell tasks that did not finish before the previous process
+	// exited ("Background shell command didn't finish before the previous
+	// session ended"). Each one is closed with a synthetic result that has
+	// origin.kind == "task-notification", no model call (num_turns == 0) and
+	// an empty result. It is emitted right after the process starts — i.e.
+	// after cc-connect has already written the user's prompt to stdin — so
+	// forwarding it as EventResult{Done:true} makes the engine finish the
+	// user's turn with "(empty response)" and push the real reply into the
+	// unsolicited relay. It carries nothing to deliver, so drop it.
+	if isEmptyTaskNotificationResult(raw, content) {
+		slog.Info("claudeSession: dropping empty task-notification result (no model call)",
+			"session_id", cs.CurrentSessionID())
+		return
+	}
+
 	// Compaction events arrive as `type:"result"` with `subtype:"compact"`
 	// or `subtype:"compaction"`. They are NOT turn completion — the CLI
 	// is mid-task and will continue streaming subsequent tool calls and
@@ -1496,19 +1592,31 @@ func (cs *claudeSession) transcriptPath() string {
 	if sessionID == "" || cs.workDir == "" {
 		return ""
 	}
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
+	// Resolve the config home from the session process env so a per-project
+	// CLAUDE_CONFIG_DIR lands on the right projects tree; cmd may be nil for
+	// externally-attached sessions, in which case we fall back to ~/.claude.
+	configHome := configHomeFromEnv(cs.cmdEnv())
+	if configHome == "" {
 		return ""
 	}
 	absWorkDir, err := filepath.Abs(cs.workDir)
 	if err != nil {
 		return ""
 	}
-	projectDir := findProjectDir(homeDir, absWorkDir)
+	projectDir := findProjectDir(configHome, absWorkDir)
 	if projectDir == "" {
 		return ""
 	}
 	return filepath.Join(projectDir, sessionID+".jsonl")
+}
+
+// cmdEnv returns the environment of the underlying claude process (empty
+// when the process is not available).
+func (cs *claudeSession) cmdEnv() []string {
+	if cs.cmd == nil || cs.cmd.Env == nil {
+		return nil
+	}
+	return cs.cmd.Env
 }
 
 // GetModel returns the model id reported by the CLI's init event (e.g.
