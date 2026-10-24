@@ -90,6 +90,13 @@ func (s *opencodeSession) Send(prompt string, messageID string, images []core.Im
 
 	cmd := exec.CommandContext(s.ctx, s.cmd, args...)
 	cmd.Dir = s.workDir
+	// Bound how long cmd.Wait() may wait for the I/O goroutines. os/exec
+	// copies the child's stderr into a buffer from its own goroutine, and
+	// that goroutine only ends when the stderr pipe reaches EOF — a
+	// descendant holding the pipe open would block the turn forever now
+	// that readLoop waits for the process before delivering the result.
+	// Same setting as the gemini/kimi/antigravity adapters.
+	cmd.WaitDelay = 1 * time.Second
 	env := os.Environ()
 	if len(s.extraEnv) > 0 {
 		env = core.MergeEnv(env, s.extraEnv)
