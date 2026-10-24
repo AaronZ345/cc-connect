@@ -193,7 +193,12 @@ func (s *opencodeSession) buildRunArgs(prompt string, imagePaths []string, chatI
 
 func (s *opencodeSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf *bytes.Buffer) {
 	defer s.wg.Done()
-	defer func() { _ = cmd.Wait() }()
+	waited := false
+	defer func() {
+		if !waited {
+			_ = cmd.Wait()
+		}
+	}()
 
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
@@ -223,6 +228,11 @@ func (s *opencodeSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBu
 		}
 		return
 	}
+
+	// exec copies stderr into stderrBuf from its own goroutine until Wait
+	// returns, so the buffer is only safe to read after that.
+	_ = cmd.Wait()
+	waited = true
 
 	stderrMsg := stderrBuf.String()
 	if stderrMsg != "" {
