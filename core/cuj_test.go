@@ -2020,7 +2020,11 @@ func TestCUJ_G4_AgentCrashReturnsErrorAndRecovers(t *testing.T) {
 // reaches the user's screen.
 func TestCUJ_G5_ToolFailureSurfacesToUser(t *testing.T) {
 	env := newCUJEnv(t)
-	defer env.engine.Stop()
+	t.Cleanup(func() {
+		if err := env.engine.Stop(); err != nil {
+			t.Error(err)
+		}
+	})
 
 	// Establish a session.
 	env.userSends("g5", "hello")

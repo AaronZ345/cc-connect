@@ -14809,7 +14809,11 @@ func TestUnsolicitedReader_KeepsLiveSessionAfterTurnError(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	sess := newControllableSession("unsol-live-error")
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
-	defer e.Stop()
+	t.Cleanup(func() {
+		if err := e.Stop(); err != nil {
+			t.Error(err)
+		}
+	})
 	const key = "test:live-error:u1"
 	session := e.sessions.GetOrCreateActive(key)
 	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
