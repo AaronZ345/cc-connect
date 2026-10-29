@@ -17351,7 +17351,7 @@ func (e *Engine) commandContextWithWorkspace(p Platform, msg *Message) (Agent, *
 // the agent's workDir in multi-workspace mode.
 func (e *Engine) resolveCurrentWorkDir(sessionKey string, switcher WorkDirSwitcher) string {
 	if e.multiWorkspace && e.projectState != nil {
-		if channelKey := extractWorkspaceChannelKey(sessionKey); channelKey != "" {
+		if channelKey := e.extractWorkspaceChannelKey(sessionKey); channelKey != "" {
 			if b, _, usable := e.lookupEffectiveWorkspaceBinding(channelKey); usable {
 				workspace := normalizeWorkspacePath(b.Workspace)
 				interactiveKey := workspace + ":" + sessionKey
