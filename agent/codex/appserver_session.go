@@ -523,10 +523,10 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 	if activeTurn != "" {
 		return s.steerTurn(threadID, activeTurn, input)
 	}
-	return s.startTurn(threadID, input)
+	return s.startTurn(threadID, input, turnRevision)
 }
 
-func (s *appServerSession) startTurn(threadID string, input []map[string]any) error {
+func (s *appServerSession) startTurn(threadID string, input []map[string]any, turnRevision uint64) error {
 	params := map[string]any{
 		"threadId": threadID,
 		"input":    input,
