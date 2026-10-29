@@ -326,6 +326,39 @@ func TestRelayManager_DefaultVisibilityEchoesFullMessages(t *testing.T) {
 	}
 }
 
+func TestRelayManager_FullVisibilityPreservesLongResponses(t *testing.T) {
+	for _, visibility := range []string{"", RelayVisibilityFull} {
+		t.Run("visibility="+visibility, func(t *testing.T) {
+			p := &relayVisibilityPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+			s := newControllableSession("long-response-session")
+			e := NewEngine("target", &controllableAgent{nextSession: s}, []Platform{p}, "", LangEnglish)
+			rm := NewRelayManager("")
+			rm.SetVisibility(visibility)
+			rm.RegisterEngine("target", e)
+			rm.Bind("test", "chat-1", map[string]string{"source": "source-bot", "target": "target-bot"})
+			response := strings.Repeat("\u5b8c\u6574\u56de\u590d", 700) + "\nFINAL_RESPONSE_END"
+			s.events <- Event{Type: EventResult, Content: response, Done: true}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			resp, err := rm.Send(ctx, RelayRequest{From: "source", To: "target", SessionKey: "test:chat-1:user", Message: "review"})
+			if err != nil {
+				t.Fatalf("Send error = %v", err)
+			}
+			if resp.Response != response {
+				t.Fatal("relay return value lost response content")
+			}
+			sent := p.getSent()
+			if len(sent) != 1 {
+				t.Fatalf("sent %d messages, want 1", len(sent))
+			}
+			want := "[target-bot] " + response
+			if sent[0] != want {
+				t.Fatalf("full response was truncated: got %d runes, want %d", len([]rune(sent[0])), len([]rune(want)))
+			}
+		})
+	}
+}
+
 func TestRelayManager_VisibilitySummarySuppressesBodies(t *testing.T) {
 	resp, sourceSent, targetSent := runRelayVisibilityScenario(t, RelayVisibilitySummary)
 
@@ -385,8 +418,13 @@ func TestHandleRelay_ReturnsPartialOnTimeout(t *testing.T) {
 	if got.err != nil {
 		t.Fatalf("HandleRelay() error = %v, want nil", got.err)
 	}
-	if got.resp != "partial response" {
-		t.Fatalf("HandleRelay() response = %q, want %q", got.resp, "partial response")
+	// The partial text is wrapped in an explicit timeout notice, so the caller
+	// can tell a truncated fragment from a real answer.
+	if !strings.Contains(got.resp, "partial response") {
+		t.Fatalf("HandleRelay() response = %q, want it to carry the partial text", got.resp)
+	}
+	if !strings.Contains(got.resp, "---") {
+		t.Fatalf("HandleRelay() response = %q, want the timeout notice around the partial text", got.resp)
 	}
 
 	// Wait for the background drain goroutine to close the session.
@@ -397,16 +435,13 @@ func TestHandleRelay_ReturnsPartialOnTimeout(t *testing.T) {
 	}
 }
 
-// TestHandleRelay_UnblocksWhenAgentGoesSilent pins the bug where the
-// event loop used `for event := range agentSession.Events()`, so the
-// goroutine parked on the receive even after the relay context had
-// timed out. If the agent went silent (stuck tool call, slow upstream,
-// hung subprocess), the relay caller waited indefinitely past the
-// configured timeout. With the fix the loop selects on ctx.Done()
-// alongside the event channel, so a silent agent no longer blocks the
-// relay from returning. The agent process is left running by design;
-// drainRelaySession finishes the turn in the background.
-func TestHandleRelay_UnblocksWhenAgentGoesSilent(t *testing.T) {
+// TestHandleRelay_TimeoutExcludesToolResults is the regression test for the
+// relay timeout path leaking the target agent's tool output back to the caller.
+// Every EventToolResult used to be appended to textParts, and on timeout
+// textParts is handed back verbatim — so a turn that ran past the deadline
+// returned the whole tool log as if it were the answer. That blob then sat in
+// the caller's context and was re-billed on every later turn of its session.
+func TestHandleRelay_TimeoutExcludesToolResults(t *testing.T) {
 	e := newTestEngine()
 	session := newControllableSession("relay-session")
 	e.agent = &controllableAgent{nextSession: session}
@@ -424,30 +459,58 @@ func TestHandleRelay_UnblocksWhenAgentGoesSilent(t *testing.T) {
 		done <- relayResult{resp: resp, err: err}
 	}()
 
-	// Emit a single text event before going completely silent. We do
-	// NOT send any event after the timeout — the production bug was
-	// exactly that the relay would hang waiting for one.
-	session.events <- Event{Type: EventText, Content: "partial response"}
+	const toolDump = "TOOL-OUTPUT-MUST-NOT-BE-RELAYED"
+	session.events <- Event{Type: EventToolResult, ToolName: "Bash", Content: toolDump, SessionID: "relay-session"}
+	session.events <- Event{Type: EventText, Content: "working on it", SessionID: "relay-session"}
+	time.Sleep(40 * time.Millisecond)
+	session.events <- Event{Type: EventThinking, Content: "still working"}
+	session.events <- Event{Type: EventResult, Content: "done", Done: true}
 
-	// The relay must return within a generous bound: the underlying
-	// ctx deadline is 20ms, so HandleRelay should observe ctx.Done()
-	// within a few hundred ms even with scheduler jitter. Without the
-	// fix the goroutine parks on the channel receive forever.
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("HandleRelay() error = %v, want nil", got.err)
+	}
+	if strings.Contains(got.resp, toolDump) {
+		t.Fatalf("HandleRelay() leaked tool output to the caller: %q", got.resp)
+	}
+	if !strings.Contains(got.resp, "working on it") {
+		t.Fatalf("HandleRelay() response = %q, want the assistant text preserved", got.resp)
+	}
+
+	select {
+	case <-session.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background drain goroutine did not close the session")
+	}
+}
+
+func TestHandleRelay_UnblocksWhenAgentGoesSilent(t *testing.T) {
+	e := newTestEngine()
+	session := newControllableSession("relay-session")
+	e.agent = &controllableAgent{nextSession: session}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	type relayResult struct {
+		resp string
+		err  error
+	}
+	done := make(chan relayResult, 1)
+	go func() {
+		resp, err := e.HandleRelay(ctx, "source", "test:chat-1:user", "hello")
+		done <- relayResult{resp: resp, err: err}
+	}()
+	session.events <- Event{Type: EventText, Content: "partial response"}
 	select {
 	case got := <-done:
 		if got.err != nil {
 			t.Fatalf("HandleRelay() error = %v, want nil", got.err)
 		}
-		if got.resp != "partial response" {
-			t.Fatalf("HandleRelay() response = %q, want %q", got.resp, "partial response")
+		if !strings.Contains(got.resp, "partial response") {
+			t.Fatalf("HandleRelay() response = %q, want partial text", got.resp)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("HandleRelay did not return after relay timeout while agent was silent")
 	}
-
-	// Unblock the background drain goroutine so it can close the
-	// session cleanly. (The drain has its own select-on-events; we
-	// still need to send something for it to consume.)
 	session.events <- Event{Type: EventResult, Content: "done"}
 	select {
 	case <-session.closed:

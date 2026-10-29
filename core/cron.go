@@ -32,7 +32,7 @@ type CronJob struct {
 	Enabled     bool      `json:"enabled"`
 	Silent      *bool     `json:"silent,omitempty"`       // suppress start notification; nil = use global default
 	Mute        bool      `json:"mute,omitempty"`         // suppress ALL messages (start + result); job runs silently
-	SessionMode string    `json:"session_mode,omitempty"` // "" = scheduler default; "reuse" = share active session; "new_per_run" = fresh session each run
+	SessionMode string    `json:"session_mode,omitempty"` // "" = use global default; "reuse" = share active session; "new_per_run" = fresh session each run
 	Mode        string    `json:"mode,omitempty"`         // permission mode override for this job; "" = use project default
 	TimeoutMins *int      `json:"timeout_mins,omitempty"` // nil = default 30m wait; 0 = no limit; >0 = minutes
 	CreatedAt   time.Time `json:"created_at"`
@@ -75,7 +75,11 @@ func (j *CronJob) UsesNewSessionPerRun() bool {
 // timer jobs. It can be overridden globally by scheduler config or per job.
 const defaultScheduledSessionMode = "new_per_run"
 
-// NormalizeCronSessionMode maps CLI/API aliases to canonical values ("", "reuse", "new_per_run").
+// NormalizeCronSessionMode maps CLI/API aliases to canonical values
+// ("", "reuse", "new_per_run"). The empty string means "unspecified" — the
+// scheduler falls back to the global default. "reuse" means the user
+// explicitly opted out of new-per-run, and is preserved separately so it can
+// override a global default of new_per_run on a per-job basis.
 // Returns the original string if unrecognized (caller should validate).
 func NormalizeCronSessionMode(s string) string {
 	s = strings.TrimSpace(s)
