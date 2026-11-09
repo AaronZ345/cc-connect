@@ -4150,6 +4150,15 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	}
 	stopTyping = nil // ownership transferred; prevent defer from double-stopping
 
+	// Recalling the active message stops its agent process, but messages queued
+	// after the recalled one are independent user turns and must survive. Move
+	// them into a replacement interactive state and continue with the oldest
+	// queued message while retaining ownership of the session lock.
+	if e.resumePendingAfterStoppedTurn(state, session, sessions, interactiveKey, agent, workspaceDir, ccSessionKey, lockGen) {
+		unlocked = true // the nested processor now owns and releases the lock
+		return
+	}
+
 	// Start unsolicited reader and arm the idle close timer BEFORE draining
 	// queued messages. drainPendingMessages releases the session lock, and
 	// without this ordering the next user message can race in, call
@@ -4174,6 +4183,71 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	if e.drainPendingMessages(state, session, sessions, interactiveKey, lockGen) {
 		unlocked = true
 	}
+}
+
+// resumePendingAfterStoppedTurn starts a replacement agent session for user
+// messages that were queued after an intentionally stopped turn (currently a
+// recalled active message). It returns true after transferring session-lock
+// ownership to the replacement processor.
+func (e *Engine) resumePendingAfterStoppedTurn(state *interactiveState, session *Session, sessions *SessionManager, interactiveKey string, agent Agent, workspaceDir, ccSessionKey string, lockGen uint64) bool {
+	state.mu.Lock()
+	if !state.stopped || len(state.pendingMessages) == 0 {
+		state.mu.Unlock()
+		return false
+	}
+	pending := append([]queuedMessage(nil), state.pendingMessages...)
+	state.pendingMessages = nil
+	state.mu.Unlock()
+
+	// New messages can arrive after the recalled state is detached but before
+	// this goroutine regains control. They live in a placeholder state; append
+	// them after the older preserved queue so FIFO order remains intact.
+	e.interactiveMu.Lock()
+	placeholder := e.interactiveStates[interactiveKey]
+	if placeholder == nil || placeholder == state {
+		placeholder = &interactiveState{eventsNeedResync: true}
+		e.interactiveStates[interactiveKey] = placeholder
+	}
+	placeholder.mu.Lock()
+	pending = append(pending, placeholder.pendingMessages...)
+	placeholder.pendingMessages = append([]queuedMessage(nil), pending[1:]...)
+	placeholder.mu.Unlock()
+	e.interactiveMu.Unlock()
+
+	next := pending[0]
+	messageSessionKey := next.msgSessionKey
+	if messageSessionKey == "" {
+		messageSessionKey = ccSessionKey
+	}
+	if messageSessionKey == "" {
+		messageSessionKey = interactiveKey
+	}
+	messagePlatform := next.msgPlatform
+	if messagePlatform == "" && next.platform != nil {
+		messagePlatform = next.platform.Name()
+	}
+
+	nextMessage := &Message{
+		SessionKey:        messageSessionKey,
+		Platform:          messagePlatform,
+		MessageID:         next.messageID,
+		UserID:            next.userID,
+		UserName:          next.userName,
+		Content:           next.content,
+		Images:            next.images,
+		Files:             next.files,
+		FromVoice:         next.fromVoice,
+		ReplyCtx:          next.replyCtx,
+		ChannelKey:        next.channelKey,
+		UserMessageTimeMs: next.userMessageTimeMs,
+	}
+	slog.Info("resuming queued messages after stopped turn",
+		"session", interactiveKey,
+		"next_msg_id", next.messageID,
+		"remaining_queue", len(pending)-1,
+	)
+	e.processInteractiveMessageWith(next.platform, nextMessage, session, agent, sessions, interactiveKey, workspaceDir, ccSessionKey, lockGen)
+	return true
 }
 
 // getOrCreateWorkspaceAgent returns (or creates) a per-workspace agent and session manager.
@@ -6846,6 +6920,13 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 channelClosed:
 	// Channel closed - process exited unexpectedly
+	// An intentional stop (notably message recall) closes the agent channel too.
+	// Its queued successors are recovered by processInteractiveMessageWith, so
+	// do not misclassify that close as a crash and drain their queue here.
+	if state.isStopped() {
+		sp.discard()
+		return
+	}
 	slog.Warn("agent process exited", "session_key", sessionKey)
 	state.mu.Lock()
 	state.eventsNeedResync = true
@@ -9096,7 +9177,7 @@ func (e *Engine) dirApply(agent Agent, sessions *SessionManager, interactiveKey,
 }
 
 func (e *Engine) cmdDir(p Platform, msg *Message, args []string) {
-	agent, sessions, interactiveKey, err := e.commandContext(p, msg)
+	agent, sessions, interactiveKey, _, err := e.commandContextWithWorkspace(p, msg)
 	if err != nil {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
@@ -9107,7 +9188,7 @@ func (e *Engine) cmdDir(p Platform, msg *Message, args []string) {
 		return
 	}
 
-	currentDir := switcher.GetWorkDir()
+	currentDir := e.resolveCurrentWorkDir(msg.SessionKey, switcher)
 
 	if len(args) == 0 {
 		if supportsCards(p) {
@@ -9487,6 +9568,15 @@ func accountDisplay(report *UsageReport) string {
 	} else {
 		base = "-"
 	}
+	// Messaging platforms may reject replies containing an email address.
+	// Keep a recognizable account hint without sending the address itself.
+	if local, _, hasDomain := strings.Cut(base, "@"); hasDomain {
+		if local == "" {
+			base = "***"
+		} else {
+			base = string([]rune(local)[0]) + "***"
+		}
+	}
 	if report.Plan != "" {
 		return fmt.Sprintf("%s (%s)", base, report.Plan)
 	}
@@ -9773,8 +9863,8 @@ func (e *Engine) renderStatusCard(sessionKey string, userID string) *Card {
 	}
 
 	workDirStr := ""
-	if wd, ok := agent.(interface{ GetWorkDir() string }); ok {
-		workDirStr = strings.TrimSpace(wd.GetWorkDir())
+	if wd, ok := agent.(WorkDirSwitcher); ok {
+		workDirStr = strings.TrimSpace(e.resolveCurrentWorkDir(sessionKey, wd))
 	}
 	if workDirStr == "" {
 		workDirStr, _ = os.Getwd()
@@ -10979,10 +11069,6 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 		}
 		if notifyQueued {
 			e.notifyDroppedQueuedMessages(state, fmt.Errorf("session cancelled"))
-		} else {
-			state.mu.Lock()
-			state.pendingMessages = nil
-			state.mu.Unlock()
 		}
 
 		// Mark eventsNeedResync so the next turn drains stale events from
@@ -11025,10 +11111,6 @@ normalCleanup:
 	}
 	if notifyQueued {
 		e.notifyDroppedQueuedMessages(state, fmt.Errorf("session reset"))
-	} else {
-		state.mu.Lock()
-		state.pendingMessages = nil
-		state.mu.Unlock()
 	}
 	e.closeAgentSessionAsync(sessionKey, agentSession, closePlatform, closeReplyCtx)
 
@@ -14023,7 +14105,7 @@ func (e *Engine) renderDirCard(sessionKey string, page int) (*Card, error) {
 	if !ok {
 		return nil, fmt.Errorf("%s", e.i18n.T(MsgDirNotSupported))
 	}
-	currentDir := switcher.GetWorkDir()
+	currentDir := e.resolveCurrentWorkDir(sessionKey, switcher)
 	var history []string
 	if e.dirHistory != nil {
 		history = e.dirHistory.List(e.name)
@@ -16726,7 +16808,42 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 	}
 
 	var textParts []string
-	for event := range agentSession.Events() {
+	events := agentSession.Events()
+	for {
+		// Use select so a timed-out relay context unblocks even when the
+		// agent has gone silent. Without this, `for event := range
+		// events` would park here past the relay deadline if the agent
+		// is stuck on a tool call, waiting on user input, or otherwise
+		// not emitting events — the relay caller would hang well beyond
+		// the configured relay timeout.
+		var (
+			event Event
+			ok    bool
+		)
+		select {
+		case event, ok = <-events:
+			if !ok {
+				// Event channel closed without EventResult.
+				if err := agentSession.Close(); err != nil {
+					slog.Debug("relay: close session after event channel closed failed", "error", err)
+				}
+				if ctx.Err() != nil {
+					return e.relayPartialResponseOrError(ctx.Err(), textParts, fromProject, e.name)
+				}
+				if len(textParts) > 0 {
+					return strings.Join(textParts, ""), nil
+				}
+				return "", fmt.Errorf("relay: agent process exited without response")
+			}
+		case <-ctx.Done():
+			// Relay timed out (or was cancelled by the caller). Let the
+			// agent finish its turn in the background so the session
+			// state is saved cleanly and the session remains resumable
+			// for the next relay call.
+			go e.drainRelaySession(agentSession, session, sessions, agent.Name(), relaySessionKey)
+			return e.relayPartialResponseOrError(ctx.Err(), textParts, fromProject, e.name)
+		}
+
 		switch event.Type {
 		case EventText:
 			if event.Content != "" {
@@ -16772,25 +16889,12 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 			})
 		}
 		if ctx.Err() != nil {
-			// Relay timed out. Let the agent finish its turn in the
-			// background so the session state is saved cleanly and the
-			// session remains resumable for the next relay call.
+			// Relay timed out while we were processing this event. Same
+			// drain path as the select case above.
 			go e.drainRelaySession(agentSession, session, sessions, agent.Name(), relaySessionKey)
 			return e.relayPartialResponseOrError(ctx.Err(), textParts, fromProject, e.name)
 		}
 	}
-
-	// Event channel closed without EventResult.
-	agentSession.Close()
-
-	if ctx.Err() != nil {
-		return e.relayPartialResponseOrError(ctx.Err(), textParts, fromProject, e.name)
-	}
-
-	if len(textParts) > 0 {
-		return strings.Join(textParts, ""), nil
-	}
-	return "", fmt.Errorf("relay: agent process exited without response")
 }
 
 // relayPartialNoticeMaxRunes bounds the partial text handed back to the caller
@@ -17239,6 +17343,27 @@ func (e *Engine) commandContextWithWorkspace(p Platform, msg *Message) (Agent, *
 		return nil, nil, "", "", err
 	}
 	return agent, sessions, interactiveKey, effectiveDir, nil
+}
+
+// resolveCurrentWorkDir returns the effective current working directory for a
+// session, checking projectState dir overrides in multi-workspace mode. This
+// is needed because dirApply stores overrides in projectState without updating
+// the agent's workDir in multi-workspace mode.
+func (e *Engine) resolveCurrentWorkDir(sessionKey string, switcher WorkDirSwitcher) string {
+	if e.multiWorkspace && e.projectState != nil {
+		if channelKey := e.extractWorkspaceChannelKey(sessionKey); channelKey != "" {
+			if b, _, usable := e.lookupEffectiveWorkspaceBinding(channelKey); usable {
+				workspace := normalizeWorkspacePath(b.Workspace)
+				interactiveKey := workspace + ":" + sessionKey
+				if override := e.projectState.WorkspaceDirOverride(interactiveKey); override != "" {
+					if info, err := os.Stat(override); err == nil && info.IsDir() {
+						return override
+					}
+				}
+			}
+		}
+	}
+	return switcher.GetWorkDir()
 }
 
 // sessionContextForKey resolves the agent and session manager for a sessionKey.
