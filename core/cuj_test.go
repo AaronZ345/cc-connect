@@ -2323,6 +2323,19 @@ func TestCUJ_H2_TwoPlatformsConcurrentNoBleed(t *testing.T) {
 	pB := &stubPlatformEngine{n: "platB"}
 	agent := &cujAgent{}
 	e := NewEngine("test", agent, []Platform{pA, pB}, dir+"/sessions.json", LangEnglish)
+	t.Cleanup(func() {
+		_ = e.Stop()
+		// The assertions complete once the user messages are in history,
+		// while queued turns may still persist their replies. Stop the
+		// engine and retry removal so t.TempDir's cleanup does not race
+		// those final writes.
+		for range 20 {
+			if err := os.RemoveAll(dir); err == nil {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
 
 	// Fire 5 messages on each platform concurrently.
 	var wg sync.WaitGroup
