@@ -7431,6 +7431,40 @@ func TestHandlePendingPermission_CronFallback(t *testing.T) {
 	}
 }
 
+// TestHandlePendingPermission_TimerFallback guards the same composite-key
+// lookup for timer jobs, which now default to a fresh session per run and
+// therefore surface their permission prompts under "key#timer:sid".
+func TestHandlePendingPermission_TimerFallback(t *testing.T) {
+	e := newTestEngine()
+	p := &stubPlatformEngine{n: "test"}
+	rec := &recordingAgentSession{}
+
+	timerKey := "test:chat:user1#timer:sid456"
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[timerKey] = &interactiveState{
+		agentSession: rec,
+		platform:     p,
+		replyCtx:     "ctx",
+		pending: &pendingPermission{
+			RequestID: "req-timer",
+			ToolInput: map[string]any{"path": "/tmp/y"},
+			Resolved:  make(chan struct{}),
+		},
+	}
+	e.interactiveMu.Unlock()
+
+	msg := &Message{SessionKey: "test:chat:user1", ReplyCtx: "ctx"}
+
+	if !e.handlePendingPermission(p, msg, "allow", "") {
+		t.Fatal("expected pending permission to be handled via timer fallback")
+	}
+	if rec.calls != 1 || rec.lastID != "req-timer" || rec.lastResult.Behavior != "allow" {
+		t.Fatalf("RespondPermission calls=%d id=%q behavior=%q, want 1/%q/allow",
+			rec.calls, rec.lastID, rec.lastResult.Behavior, "req-timer")
+	}
+}
+
 // ──────────────────────────────────────────────────────────────
 // Session routing / cleanup CAS tests
 // ──────────────────────────────────────────────────────────────
@@ -11094,6 +11128,104 @@ func TestHandleMessageRecallPreservesLaterQueueWhenAgentChannelCloses(t *testing
 	}
 	if len(replacementSession.sentPrompts) != 1 || !strings.Contains(replacementSession.sentPrompts[0], "later message") {
 		t.Fatalf("replacement prompts = %v, want later queued message", replacementSession.sentPrompts)
+	}
+}
+
+// TestResumePendingAfterStoppedTurnReacquiresLock covers the recall handoff:
+// the stopped turn force-unlocked and bumped the generation, so the resume
+// path must take a fresh lock before running preserved work. Without it the
+// resumed turn runs unlocked while new messages start competing turns.
+func TestResumePendingAfterStoppedTurnReacquiresLock(t *testing.T) {
+	e := newTestEngine()
+	key := "test:recall-lock"
+	session := &Session{ID: "sid"}
+	staleGen, ok := session.TryLock()
+	if !ok {
+		t.Fatal("expected to take the initial lock")
+	}
+	if !session.ForceUnlock() {
+		t.Fatal("expected ForceUnlock to release the lock")
+	}
+
+	state := &interactiveState{
+		stopped: true,
+		pendingMessages: []queuedMessage{{
+			messageID: "msg-later",
+			platform:  &stubPlatformEngine{n: "test"},
+			replyCtx:  "ctx-later",
+			content:   "later",
+		}},
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	agentSession := newResultAgentSession("recovered")
+	agent := &controllableAgent{nextSession: agentSession}
+	sessions := NewSessionManager("")
+	sessions.sessions[session.ID] = session
+	sessions.activeSession["k"] = session.ID
+
+	_ = staleGen
+	if !e.resumePendingAfterStoppedTurn(state, session, sessions, key, agent, "", "", staleGen) {
+		t.Fatal("expected the preserved queue to be resumed")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(agentSession.sentPrompts) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(agentSession.sentPrompts) != 1 {
+		t.Fatalf("resumed prompts = %v, want one preserved turn", agentSession.sentPrompts)
+	}
+	if session.Busy() {
+		t.Fatal("expected the resumed turn to release the reacquired lock")
+	}
+}
+
+// TestResumePendingAfterStoppedTurnHandsOffWhenBusy ensures a newer owner of
+// the session lock keeps its queue instead of having it stolen by the stopped
+// turn's goroutine.
+func TestResumePendingAfterStoppedTurnHandsOffWhenBusy(t *testing.T) {
+	e := newTestEngine()
+	key := "test:recall-handoff"
+	session := &Session{ID: "sid"}
+	if gen, ok := session.TryLock(); ok {
+		session.ForceUnlock()
+		_ = gen
+	}
+
+	state := &interactiveState{
+		stopped: true,
+		pendingMessages: []queuedMessage{{
+			messageID: "msg-preserved",
+			platform:  &stubPlatformEngine{n: "test"},
+			replyCtx:  "ctx",
+			content:   "preserved",
+		}},
+	}
+	currentOwner := &interactiveState{}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = currentOwner
+	e.interactiveMu.Unlock()
+
+	// A newer turn holds the lock.
+	if _, ok := session.TryLock(); !ok {
+		t.Fatal("expected the newer turn to own the lock")
+	}
+
+	if !e.resumePendingAfterStoppedTurn(state, session, NewSessionManager(""), key,
+		&controllableAgent{nextSession: newResultAgentSession("x")}, "", "", 0) {
+		t.Fatal("expected handoff to report the turn as completed")
+	}
+
+	currentOwner.mu.Lock()
+	queued := append([]queuedMessage(nil), currentOwner.pendingMessages...)
+	currentOwner.mu.Unlock()
+	if len(queued) != 1 || queued[0].messageID != "msg-preserved" {
+		t.Fatalf("current owner queue = %+v, want the preserved message", queued)
+	}
+	if !session.Busy() {
+		t.Fatal("stopped turn must not release the newer owner's lock")
 	}
 }
 
