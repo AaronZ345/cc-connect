@@ -3593,24 +3593,27 @@ func (e *Engine) handlePendingPermission(p Platform, msg *Message, content strin
 	state, pending := e.lookupPending(iKey)
 
 	if state == nil || pending == nil {
-		// Fallback: cron new-per-run sessions use composite keys like
-		// "key#cron:sid" which won't match the plain sessionKey from
-		// platform permission button callbacks.
+		// Fallback: scheduled new-per-run sessions use composite keys like
+		// "key#cron:sid" or "key#timer:sid" which won't match the plain
+		// sessionKey from platform permission button callbacks.
 		e.interactiveMu.Lock()
-		prefix := iKey + "#cron:"
-		var cronKeys []string
+		var scheduledKeys []string
 		for k := range e.interactiveStates {
-			if strings.HasPrefix(k, prefix) {
-				cronKeys = append(cronKeys, k)
+			for _, scope := range []string{"#cron:", "#timer:"} {
+				if strings.HasPrefix(k, iKey+scope) {
+					scheduledKeys = append(scheduledKeys, k)
+					break
+				}
 			}
 		}
 		e.interactiveMu.Unlock()
-		// If multiple cron runs coexist for the same session, pick
+		// If multiple scheduled runs coexist for the same session, pick
 		// the first with a pending permission. In practice only one
-		// cron run per session should be in the pending state at a
+		// scheduled run per session should be in the pending state at a
 		// time, so this loop is bounded and deterministic for the
-		// expected case.
-		for _, k := range cronKeys {
+		// expected case. Timer jobs inherit the same composite key shape
+		// now that they too default to a fresh session per run.
+		for _, k := range scheduledKeys {
 			state, pending = e.lookupPending(k)
 			if state != nil && pending != nil {
 				goto found
@@ -4199,17 +4202,61 @@ func (e *Engine) resumePendingAfterStoppedTurn(state *interactiveState, session 
 	state.pendingMessages = nil
 	state.mu.Unlock()
 
+	// The recalled turn released the busy lock through ForceUnlock, which also
+	// bumped the generation. The generation captured before the recall can no
+	// longer release the lock or exclude anyone, so reacquire it here before
+	// running the preserved work.
+	freshGen, locked := session.TryLock()
+	if !locked {
+		// A newer turn already owns the session. Hand the preserved queue to
+		// the replacement state instead of stealing it or running alongside.
+		e.handoffPreservedQueue(interactiveKey, state, pending)
+		// This turn no longer owns the session lock, so report the turn as
+		// fully handed off: the caller must not unlock (its generation is
+		// stale) and must not drain the queue alongside the new owner.
+		return true
+	}
+	lockGen = freshGen
+
 	// New messages can arrive after the recalled state is detached but before
 	// this goroutine regains control. They live in a placeholder state; append
 	// them after the older preserved queue so FIFO order remains intact.
 	e.interactiveMu.Lock()
 	placeholder := e.interactiveStates[interactiveKey]
 	if placeholder == nil || placeholder == state {
-		placeholder = &interactiveState{eventsNeedResync: true}
+		// Carry the stopped turn's watermarks over so the stale check below
+		// keeps the same meaning it has on the ordinary drain path.
+		state.mu.Lock()
+		watermark := state.currentTurnUserMessageTimeMs
+		completed := state.lastCompletedUserMessageTimeMs
+		state.mu.Unlock()
+		placeholder = &interactiveState{
+			eventsNeedResync:               true,
+			currentTurnUserMessageTimeMs:   watermark,
+			lastCompletedUserMessageTimeMs: completed,
+		}
 		e.interactiveStates[interactiveKey] = placeholder
 	}
 	placeholder.mu.Lock()
 	pending = append(pending, placeholder.pendingMessages...)
+	droppedStale := 0
+	for len(pending) > 0 && e.isQueuedUserMessageStaleForDrainLocked(placeholder, pending[0].userMessageTimeMs) {
+		pending = pending[1:]
+		droppedStale++
+	}
+	if droppedStale > 0 {
+		slog.Info("dropped stale queued user messages while resuming after stop",
+			"session", interactiveKey,
+			"dropped", droppedStale,
+		)
+	}
+	if len(pending) == 0 {
+		placeholder.pendingMessages = nil
+		placeholder.mu.Unlock()
+		e.interactiveMu.Unlock()
+		session.Unlock(lockGen)
+		return true
+	}
 	placeholder.pendingMessages = append([]queuedMessage(nil), pending[1:]...)
 	placeholder.mu.Unlock()
 	e.interactiveMu.Unlock()
@@ -4248,6 +4295,24 @@ func (e *Engine) resumePendingAfterStoppedTurn(state *interactiveState, session 
 	)
 	e.processInteractiveMessageWith(next.platform, nextMessage, session, agent, sessions, interactiveKey, workspaceDir, ccSessionKey, lockGen)
 	return true
+}
+
+// handoffPreservedQueue moves messages preserved across a stopped turn into
+// the replacement interactive state so the turn that currently owns the
+// session lock drains them in FIFO order.
+func (e *Engine) handoffPreservedQueue(interactiveKey string, stopped *interactiveState, pending []queuedMessage) {
+	e.interactiveMu.Lock()
+	defer e.interactiveMu.Unlock()
+	placeholder := e.interactiveStates[interactiveKey]
+	if placeholder == nil || placeholder == stopped {
+		placeholder = &interactiveState{eventsNeedResync: true}
+		e.interactiveStates[interactiveKey] = placeholder
+	}
+	// Only the state stored under this key is eligible. Anything else means
+	// the newer owner already replaced it and owns its own queue.
+	placeholder.mu.Lock()
+	placeholder.pendingMessages = append(pending, placeholder.pendingMessages...)
+	placeholder.mu.Unlock()
 }
 
 // getOrCreateWorkspaceAgent returns (or creates) a per-workspace agent and session manager.
