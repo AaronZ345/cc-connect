@@ -167,6 +167,9 @@ func (cs *codexSession) Send(prompt string, messageID string, images []core.Imag
 
 	cmd := exec.CommandContext(cs.ctx, bin, args...)
 	cmd.Dir = cs.workDir
+	// A killed process group can leave inherited stdout pipes open briefly.
+	// Bound Wait so Close can finish once the leader and its pipes are gone.
+	cmd.WaitDelay = codexSessionForceKillWait
 	prepareCmdForKill(cmd)
 	if len(cs.extraEnv) > 0 {
 		cmd.Env = core.MergeEnv(os.Environ(), cs.extraEnv)
@@ -376,14 +379,14 @@ func (cs *codexSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf 
 		defer cs.removeCmd(cmd)
 		if err := cmd.Wait(); err != nil {
 			stderrMsg := strings.TrimSpace(stderrBuf.String())
-			if stderrMsg != "" {
+			// Close cancels the session before killing the group. A killed
+			// child can still report on stderr during teardown, and an error
+			// event would race the sealed event channel. Report failures only
+			// while the session is live.
+			if stderrMsg != "" && cs.ctx.Err() == nil {
 				slog.Error("codexSession: process failed", "error", err, "stderr", stderrMsg)
 				evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}
-				select {
-				case cs.events <- evt:
-				case <-cs.ctx.Done():
-					return
-				}
+				cs.events <- evt
 			}
 		}
 		if tid := cs.CurrentSessionID(); tid != "" {
@@ -408,6 +411,11 @@ func (cs *codexSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf 
 		cs.handleEvent(raw)
 		return nil
 	}); err != nil {
+		// Close cancels before it force-kills the group. A read error caused by
+		// that teardown is not a turn event and must not race the channel seal.
+		if cs.ctx.Err() != nil {
+			return
+		}
 		slog.Error("codexSession: read stdout error", "error", err)
 		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", err)}
 		select {
