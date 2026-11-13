@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -1131,6 +1132,55 @@ func TestClose_ForceKillsProcessStillRunningAfterTurnCompleted(t *testing.T) {
 		}
 	case <-time.After(700 * time.Millisecond):
 		t.Fatal("timed out waiting for events channel to close")
+	}
+}
+
+// TestReadLoopProcessExitRespectsCancel guards the teardown path: when a
+// failed subprocess's stderr event cannot fit in a full buffer, the read loop
+// must still observe Close's cancellation instead of blocking forever and
+// leaving wg.Done (and the events-channel close) unreachable.
+func TestReadLoopProcessExitRespectsCancel(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process-group semantics differ on windows")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cs := &codexSession{
+		events:   make(chan core.Event, 1),
+		ctx:      ctx,
+		cancel:   cancel,
+		cmds:     make(map[*exec.Cmd]struct{}),
+		turnDone: make(chan struct{}),
+	}
+	// Leave no room for the process-exit error event.
+	cs.events <- core.Event{Type: core.EventText}
+
+	cmd := exec.Command("sh", "-c", "exit 3")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	stderrBuf := bytes.Buffer{}
+	stderrBuf.WriteString("boom")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	cs.wg.Add(1)
+	go cs.readLoop(cmd, stdout, &stderrBuf)
+
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		cs.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("read loop blocked on a full event buffer instead of observing cancellation")
 	}
 }
 
