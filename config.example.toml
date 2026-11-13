@@ -1076,6 +1076,11 @@ app_secret = "your-feishu-app-secret"
 # domain = "https://open.feishu.cn"  # Optional runtime API/WebSocket base URL override / 可选：运行时 API/WebSocket 域名覆盖
 # enable_feishu_card = true  # Enable Feishu interactive cards (default: true); set false to force plain-text replies
 #                              # 启用飞书交互式卡片（默认 true）；设为 false 时强制回退纯文本回复
+# print_frequency_ms = 50  # Typewriter interval: 20–1000 ms; lower = faster / 打字间隔，越小越快
+#                           # Example only; omit to retain Feishu defaults / 仅为示例；不配置则沿用飞书默认值
+# print_step = 2           # Characters per tick: 1–1000 / 每次上屏字符数
+# print_strategy = "fast"  # fast flushes pending text; delay queues it / fast 快速上屏，delay 排队
+#                         # Omitted values use Feishu defaults / 未配置沿用飞书默认
 # allow_from = "*"          # Allowed user open_ids, comma-separated; "*" = all (default). Use /whoami to get your open_id.
 #                              # 允许的用户 open_id，逗号分隔；"*" 表示所有（默认）。发送 /whoami 获取你的 open_id。
 # allow_chat = "*"          # Allowed group chat_ids, comma-separated; "*" = all (default). Find chat_id in group settings.
@@ -1146,6 +1151,11 @@ app_secret = "your-feishu-app-secret"
 # callback_path = "/feishu/webhook"  # Webhook callback path / Webhook 回调路径
 # encrypt_key = ""               # Event encrypt key (optional) / 事件加密密钥（可选）
 # enable_feishu_card = true
+# print_frequency_ms = 50  # Typewriter interval: 20–1000 ms; lower = faster / 打字间隔，越小越快
+#                           # Example only; omit to retain Feishu defaults / 仅为示例；不配置则沿用飞书默认值
+# print_step = 2           # Characters per tick: 1–1000 / 每次上屏字符数
+# print_strategy = "fast"  # fast flushes pending text; delay queues it / fast 快速上屏，delay 排队
+#                         # Omitted values use Feishu defaults / 未配置沿用飞书默认
 # allow_from = "*"
 # reaction_emoji = "OnIt"
 # done_emoji = "none"
@@ -1319,9 +1329,12 @@ app_secret = "your-feishu-app-secret"
 # share_session_in_channel = false  # If true, all users in a channel share one agent session / 频道共享会话
 # session_scope = "user"  # Session granularity: "user" (default, per channel+user) |
 #                         # "channel" (one session per channel, same as share_session_in_channel) |
-#                         # "thread" (one session per Slack thread — a new top-level message starts
-#                         #  a fresh session, replies in the same thread continue it).
-#                         # 会话粒度："user"(默认) | "channel"(整个频道一个会话) | "thread"(每个 Slack 话题串一个会话)
+#                         # "thread" (one session per Slack thread — a new top-level channel message
+#                         #  starts a fresh session, replies in the same thread continue it; top-level
+#                         #  DMs are not split: they stay one continuous per-user session; only
+#                         #  replies inside a DM thread get a per-thread session).
+#                         # 会话粒度："user"(默认) | "channel"(整个频道一个会话) | "thread"(每个 Slack 话题串一个会话；
+#                         #  私信里的顶层消息不拆分，仍是同一个连续会话，只有在私信的话题串里回复才单独成会话)
 
 # Google Chat (uncomment to enable / 取消注释以启用)
 # Uses a registered Google Chat app whose Cloud Pub/Sub connection publishes
@@ -1625,6 +1638,8 @@ app_secret = "your-feishu-app-secret"
 #
 # Optional: prepend a UTF-8 instructions file to every turn, reloading changes each time.
 # instructions_file = "/path/to/AGENTS.md"
+# /memory and /cron setup write <work_dir>/AGENTS.md, which Cursor loads on its own.
+# /memory 与 /cron setup 写入 <work_dir>/AGENTS.md，Cursor 会自行加载。
 #
 # Mode options / 模式说明:
 # - "default": Trust workspace, ask before tool use / 信任工作区，工具调用前询问

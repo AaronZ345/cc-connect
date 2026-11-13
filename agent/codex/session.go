@@ -386,7 +386,14 @@ func (cs *codexSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf 
 			if stderrMsg != "" && cs.ctx.Err() == nil {
 				slog.Error("codexSession: process failed", "error", err, "stderr", stderrMsg)
 				evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}
-				cs.events <- evt
+				// Respect cancellation here too: a full event buffer must not
+				// pin the read loop past Close, otherwise wg.Done never runs
+				// and the events channel is never closed.
+				select {
+				case cs.events <- evt:
+				case <-cs.ctx.Done():
+					return
+				}
 			}
 		}
 		if tid := cs.CurrentSessionID(); tid != "" {
