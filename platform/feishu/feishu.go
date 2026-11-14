@@ -150,6 +150,7 @@ type Platform struct {
 	groupOnly                  bool
 	groupReplyAll              bool
 	skipWhenMentionOthers      bool
+	groupReplyAllChats         map[string]struct{}
 	respondToAtEveryoneAndHere bool
 	shareSessionInChannel      bool
 	threadIsolation            bool
@@ -186,13 +187,16 @@ type Platform struct {
 	recalledMu             sync.Mutex
 	recalledMsgIDs         map[string]time.Time // message_id -> recall time, short TTL race guard
 	// Webhook mode fields (for Lark international version)
-	server       *http.Server
-	port         string
-	callbackPath string
-	encryptKey   string
-	eventHandler *dispatcher.EventDispatcher
-	sharedGroup  *sharedWSGroup // non-nil when sharing WebSocket with other platforms
-	isWSPrimary  bool           // true if this platform owns the shared WebSocket connection
+	server            *http.Server
+	port              string
+	callbackPath      string
+	encryptKey        string
+	eventHandler      *dispatcher.EventDispatcher
+	sharedGroup       *sharedWSGroup // non-nil when sharing WebSocket with other platforms
+	isWSPrimary       bool           // true if this platform owns the shared WebSocket connection
+	lifecycleHandler  core.PlatformLifecycleHandler
+	lifecycleReady    bool
+	lifecycleStopping bool
 	// cardActionMessageIDs tracks the most recent card-action messageID per
 	// session key, enabling async card refreshes via the Patch API.
 	cardActionMsgMu  sync.Mutex
@@ -225,9 +229,14 @@ type Platform struct {
 	// message) caused the first (oldest create_time) image to be dropped by
 	// core/engine's create_time watermark (PR #1168), so only N-1 images were
 	// ever delivered to the agent (issue #1395).
-	imageBatchMu     sync.Mutex
-	imageBatch       map[string]*imageBatchEntry
-	imageBatchWindow time.Duration // quiet period before flushing a batch; 0 means use defaultImageBatchWindow
+	imageBatchMu           sync.Mutex
+	imageBatch             map[string]*imageBatchEntry
+	imageBatchWindow       time.Duration // quiet period before flushing a batch; 0 means use defaultImageBatchWindow
+	inboundCoalesceWindow  time.Duration
+	inboundDispatchMu      sync.Mutex // serialize timer delivery with immediate commands
+	inboundCoalesceMu      sync.Mutex
+	inboundCoalesce        map[string]*inboundBatch
+	inboundCoalesceStopped bool
 
 	// resourceDownloadHTTP is the bare HTTP client used to download message
 	// resources directly from Feishu with HTTP Range requests. The larkim SDK's
@@ -350,6 +359,48 @@ func New(opts map[string]any) (core.Platform, error) {
 	return newPlatform("feishu", lark.FeishuBaseUrl, opts)
 }
 
+// parseGroupReplyAllChats parses the optional comma-separated chat allowlist
+// used to bypass the Feishu @mention gate for selected group chats. TOML
+// arrays are accepted as well so callers can use either a compact string or
+// an explicit list.
+func parseGroupReplyAllChats(raw any) (map[string]struct{}, error) {
+	if raw == nil {
+		return nil, nil
+	}
+
+	var values []string
+	switch typed := raw.(type) {
+	case string:
+		values = strings.Split(typed, ",")
+	case []string:
+		values = typed
+	case []any:
+		values = make([]string, 0, len(typed))
+		for i, value := range typed {
+			text, ok := value.(string)
+			if !ok {
+				return nil, fmt.Errorf("entry %d must be a string, got %T", i, value)
+			}
+			values = append(values, text)
+		}
+	default:
+		return nil, fmt.Errorf("must be a comma-separated string or string array, got %T", raw)
+	}
+
+	result := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		chatID := strings.TrimSpace(value)
+		if chatID == "" {
+			continue
+		}
+		result[chatID] = struct{}{}
+	}
+	if len(result) == 0 {
+		return nil, nil
+	}
+	return result, nil
+}
+
 func newPlatform(name, domain string, opts map[string]any) (core.Platform, error) {
 	appID, _ := opts["app_id"].(string)
 	appSecret, _ := opts["app_secret"].(string)
@@ -387,6 +438,10 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	groupOnly, _ := opts["group_only"].(bool)
 	groupReplyAll, _ := opts["group_reply_all"].(bool)
 	skipWhenMentionOthers, _ := opts["skip_when_mention_others"].(bool)
+	groupReplyAllChats, err := parseGroupReplyAllChats(opts["group_reply_all_chats"])
+	if err != nil {
+		return nil, fmt.Errorf("%s: invalid group_reply_all_chats: %w", name, err)
+	}
 	// require_mention = false is equivalent to group_reply_all = true:
 	// both mean "respond to all group messages without needing an @mention".
 	if v, ok := opts["require_mention"].(bool); ok && !v {
@@ -488,6 +543,15 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		imageBatchWindow = time.Duration(ms) * time.Millisecond
 	}
 
+	inboundCoalesceWindow := time.Duration(0)
+	if raw, ok := opts["inbound_coalesce_window_ms"]; ok {
+		ms, err := coerceMilliseconds(raw)
+		if err != nil || ms < 0 || ms > 60000 {
+			return nil, fmt.Errorf("%s: inbound_coalesce_window_ms must be an integer from 0 to 60000", name)
+		}
+		inboundCoalesceWindow = time.Duration(ms) * time.Millisecond
+	}
+
 	// resource_chunk_size_bytes: byte size for each Range request when chunked-
 	// downloading Feishu message resources (issue #1741). The larkim SDK does
 	// not expose Range headers, so for resources above ~2 MiB a plain GET
@@ -541,6 +605,7 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		groupOnly:                  groupOnly,
 		groupReplyAll:              groupReplyAll,
 		skipWhenMentionOthers:      skipWhenMentionOthers,
+		groupReplyAllChats:         groupReplyAllChats,
 		respondToAtEveryoneAndHere: respondToAtEveryoneAndHere,
 		shareSessionInChannel:      shareSessionInChannel,
 		threadIsolation:            threadIsolation,
@@ -557,6 +622,7 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		mentionMap:                 mentionMap,
 		imageBatch:                 make(map[string]*imageBatchEntry),
 		imageBatchWindow:           imageBatchWindow,
+		inboundCoalesceWindow:      inboundCoalesceWindow,
 		resourceDownloadHTTP:       &http.Client{Timeout: 60 * time.Second},
 		resourceChunkSize:          resourceChunkSize,
 		resourceMaxBytes:           defaultResourceMaxBytes,
@@ -575,6 +641,17 @@ func (p *Platform) Name() string { return p.platformName }
 func (p *Platform) ProgressStyle() string { return p.progressStyle }
 
 func (p *Platform) SupportsProgressCardPayload() bool { return true }
+
+// groupReplyAllForChat reports whether an unmentioned message from chatID
+// should bypass the local @mention gate. A non-empty per-chat list takes
+// precedence over the legacy platform-wide group_reply_all switch.
+func (p *Platform) groupReplyAllForChat(chatID string) bool {
+	if len(p.groupReplyAllChats) > 0 {
+		_, ok := p.groupReplyAllChats[strings.TrimSpace(chatID)]
+		return ok
+	}
+	return p.groupReplyAll
+}
 
 func (p *Platform) tag() string { return p.platformName }
 
@@ -613,9 +690,48 @@ func (p *Platform) KeepPreviewOnFinish() bool {
 	return p.useInteractiveCard
 }
 
+func (p *Platform) SetLifecycleHandler(h core.PlatformLifecycleHandler) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lifecycleHandler = h
+}
+
+func (p *Platform) notifyUnavailable(err error) {
+	p.mu.Lock()
+	if p.lifecycleStopping || !p.lifecycleReady {
+		p.mu.Unlock()
+		return
+	}
+	p.lifecycleReady = false
+	handler := p.lifecycleHandler
+	p.mu.Unlock()
+	if handler != nil {
+		handler.OnPlatformUnavailable(p, err)
+	}
+}
+
+func (p *Platform) notifyReady() {
+	p.mu.Lock()
+	if p.lifecycleStopping || p.lifecycleReady {
+		p.mu.Unlock()
+		return
+	}
+	p.lifecycleReady = true
+	handler := p.lifecycleHandler
+	p.mu.Unlock()
+	if handler != nil {
+		handler.OnPlatformReady(p)
+	}
+}
+
 func (p *Platform) Start(handler core.MessageHandler) error {
+	p.inboundCoalesceMu.Lock()
+	p.inboundCoalesceStopped = false
+	p.inboundCoalesceMu.Unlock()
 	p.mu.Lock()
 	p.handler = handler
+	p.lifecycleStopping = false
+	p.lifecycleReady = false
 	p.mu.Unlock()
 
 	// In webhook mode (private/self-hosted Feishu/Lark), startup must not depend
@@ -658,6 +774,7 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 	// Secondary platforms skip connection creation — the primary's connection
 	// fans out events to all platforms in the shared group.
 	if !isPrimary {
+		group.syncLifecycle(p)
 		return nil
 	}
 
@@ -725,7 +842,12 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 	}
 
 	if p.shouldUseWebhookMode() {
-		return p.startWebhookMode()
+		if err := p.startWebhookMode(); err != nil {
+			unregisterSharedWS(p)
+			p.stopGroupFilterSupervisor()
+			return err
+		}
+		return nil
 	}
 
 	return p.startWebSocketMode()
@@ -741,6 +863,30 @@ func (p *Platform) startWebSocketMode() error {
 		larkws.WithEventHandler(p.eventHandler),
 		larkws.WithLogLevel(larkcore.LogLevelInfo),
 		larkws.WithLogger(&sanitizingLogger{inner: larkcore.NewEventLogger()}),
+		// Use SDK-provided lifecycle callbacks to track connection state.
+		// These fire on actual WebSocket state transitions, solving the
+		// silent-disconnect problem where the SDK reconnects internally
+		// but the engine has no visibility into the state change.
+		larkws.WithOnReady(func() {
+			slog.Info(p.tag() + ": websocket connected, platform ready")
+			p.sharedGroup.setLifecycle(true, nil)
+		}),
+		larkws.WithOnDisconnected(func() {
+			slog.Warn(p.tag() + ": websocket disconnected")
+			p.sharedGroup.setLifecycle(false, fmt.Errorf("feishu: websocket disconnected"))
+		}),
+		larkws.WithOnReconnecting(func() {
+			slog.Warn(p.tag() + ": websocket reconnecting")
+			p.sharedGroup.setLifecycle(false, fmt.Errorf("feishu: websocket reconnecting"))
+		}),
+		larkws.WithOnReconnected(func() {
+			slog.Info(p.tag() + ": websocket reconnected, platform ready")
+			p.sharedGroup.setLifecycle(true, nil)
+		}),
+		larkws.WithOnError(func(err error) {
+			slog.Error(p.tag()+": websocket error", "error", err)
+			p.sharedGroup.setLifecycle(false, err)
+		}),
 	}
 	if p.domain != lark.FeishuBaseUrl {
 		wsOpts = append(wsOpts, larkws.WithDomain(p.domain))
@@ -754,7 +900,8 @@ func (p *Platform) startWebSocketMode() error {
 
 	go func() {
 		if err := p.wsClient.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			slog.Error(p.tag()+": websocket error", "error", err)
+			slog.Error(p.tag()+": websocket fatal error, platform unavailable", "error", err)
+			p.sharedGroup.setLifecycle(false, err)
 		}
 	}()
 
@@ -776,13 +923,18 @@ func (p *Platform) startWebhookMode() error {
 	p.cancel = cancel
 	p.mu.Unlock()
 
+	listener, err := net.Listen("tcp", p.server.Addr)
+	if err != nil {
+		return fmt.Errorf("feishu: webhook listen: %w", err)
+	}
+	p.sharedGroup.setLifecycle(true, nil)
 	go func() {
 		slog.Info(p.tag()+": webhook server listening", "port", p.port, "path", p.callbackPath)
-		if err := p.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := p.server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			slog.Error(p.tag()+": webhook server error", "error", err)
+			p.sharedGroup.setLifecycle(false, err)
 		}
 	}()
-
 	return nil
 }
 
@@ -1277,6 +1429,17 @@ func (p *Platform) dispatchCardActionMessage(chatID string, msg *core.Message) {
 }
 
 func (p *Platform) dispatchCoreMessage(msg *core.Message) {
+	if p.inboundCoalesceWindow > 0 && msg != nil {
+		p.inboundDispatchMu.Lock()
+		defer p.inboundDispatchMu.Unlock()
+		p.populateWorkspaceChannelKeys(msg)
+		p.coalesceInboundMessage(msg)
+		return
+	}
+	p.deliverCoreMessage(msg)
+}
+
+func (p *Platform) deliverCoreMessage(msg *core.Message) {
 	h := p.getHandler()
 	if msg == nil || h == nil {
 		return
@@ -1810,6 +1973,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	if msg.ChatType != nil {
 		chatType = *msg.ChatType
 	}
+	groupReplyAllForChat := p.groupReplyAllForChat(chatID)
 	mentionCount := len(msg.Mentions)
 	slog.Debug(p.tag()+": inbound message",
 		"message_id", messageID,
@@ -1819,8 +1983,9 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 		"thread_id", stringValue(msg.ThreadId),
 		"parent_id", stringValue(msg.ParentId),
 		"mentions", mentionCount,
-		"group_reply_all", p.groupReplyAll,
 		"skip_when_mention_others", p.skipWhenMentionOthers,
+		"group_reply_all", groupReplyAllForChat,
+		"group_reply_all_chats", len(p.groupReplyAllChats),
 		"thread_isolation", p.threadIsolation,
 	)
 
@@ -1836,7 +2001,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	// that explicitly mention someone else. An empty botOpenID is deliberately
 	// fail-closed here: enabling this option while bot discovery is unavailable
 	// drops all mentioned group messages rather than letting this bot compete.
-	if shouldSkipMentionedOthers(chatType, p.groupReplyAll, p.skipWhenMentionOthers, len(msg.Mentions), botMentioned) {
+	if shouldSkipMentionedOthers(chatType, groupReplyAllForChat, p.skipWhenMentionOthers, len(msg.Mentions), botMentioned) {
 		slog.Debug(p.tag()+": skipping group message that mentions others only",
 			"chat_id", chatID, "message_id", messageID)
 		return nil
@@ -1847,7 +2012,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	// existing mention filter and before allow_from: the chat controls whether
 	// cc-connect may observe the conversation, while allow_from controls who may
 	// trigger an agent turn.
-	if p.groupChatHistoryShare && chatType == "group" && !p.groupReplyAll && botOpenID != "" &&
+	if p.groupChatHistoryShare && chatType == "group" && !groupReplyAllForChat && botOpenID != "" &&
 		!botMentioned && !atEveryone && isGroupHistoryMessageType(msgType) {
 		if !core.AllowList(p.allowChat, chatID) {
 			slog.Debug(p.tag()+": group history ignored for unauthorized chat", "chat_id", chatID)
@@ -1866,7 +2031,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	// rest of the process lifetime. We now consult both flags: when
 	// the filter is degraded we fail closed (drop the message) and
 	// emit a periodic warning, instead of failing open.
-	if chatType == "group" && !p.groupReplyAll && filterActive {
+	if chatType == "group" && !groupReplyAllForChat && filterActive {
 		if !botMentioned {
 			switch {
 			// Feishu @all sends {"text":"@_all"} with 0 mentions.
@@ -1940,7 +2105,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 
 	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
 	var groupHistoryCtx groupHistoryContext
-	if p.groupChatHistoryShare && chatType == "group" && !p.groupReplyAll && botOpenID != "" && (botMentioned || atEveryone) {
+	if p.groupChatHistoryShare && chatType == "group" && !groupReplyAllForChat && botOpenID != "" && (botMentioned || atEveryone) {
 		scope := p.groupHistoryScope(msg, chatID)
 		if p.isGroupHistoryNewCommand(msgType, content, mentions) {
 			p.resetGroupHistory(scope)
@@ -5782,6 +5947,12 @@ func (p *Platform) updateCardEntity(ctx context.Context, h *feishuPreviewHandle,
 }
 
 func (p *Platform) Stop() error {
+	p.mu.Lock()
+	p.lifecycleStopping = true
+	p.mu.Unlock()
+	if p.isWSPrimary && p.sharedGroup != nil {
+		p.sharedGroup.stopLifecycle(fmt.Errorf("feishu: primary connection stopped"))
+	}
 	// Issue #1618: stop the background supervisor that retries the
 	// bot-info API when startup discovery fails. Without this the
 	// goroutine could outlive the platform and leak into the next
@@ -5809,6 +5980,7 @@ func (p *Platform) Stop() error {
 	}
 	// Flush any pending image batches so buffered images aren't lost on shutdown.
 	p.flushImageBatches()
+	p.flushInboundCoalesced()
 	return nil
 }
 
