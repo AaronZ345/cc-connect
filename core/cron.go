@@ -71,6 +71,10 @@ func (j *CronJob) UsesNewSessionPerRun() bool {
 	return NormalizeCronSessionMode(j.SessionMode) == "new_per_run"
 }
 
+// defaultScheduledSessionMode is the built-in default for scheduled cron and
+// timer jobs. It can be overridden globally by scheduler config or per job.
+const defaultScheduledSessionMode = "new_per_run"
+
 // NormalizeCronSessionMode maps CLI/API aliases to canonical values
 // ("", "reuse", "new_per_run"). The empty string means "unspecified" — the
 // scheduler falls back to the global default. "reuse" means the user
@@ -273,12 +277,22 @@ func (s *CronStore) ListBySessionKey(sessionKey string) []*CronJob {
 	return out
 }
 
+// Get returns a shallow copy of the job matching id, or nil if not
+// found. Returning a copy (rather than the stored pointer) is what
+// lets callers — executeJob, the management cron PATCH handler, the
+// /cron/edit API echo, etc. — read mutable fields like Prompt,
+// SessionKey, Enabled, LastRun without racing with concurrent
+// Update / SetEnabled / MarkRun writers that grab s.mu. The pointer
+// fields on CronJob (Silent, TimeoutMins) are only ever reassigned
+// to a fresh local in updateJobField, never mutated in place, so a
+// shallow copy is sufficient.
 func (s *CronStore) Get(id string) *CronJob {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, j := range s.jobs {
 		if j.ID == id {
-			return j
+			cp := *j
+			return &cp
 		}
 	}
 	return nil
@@ -447,7 +461,7 @@ type CronScheduler struct {
 	entries            map[string]*cronEntry
 	mu                 sync.RWMutex
 	defaultSilent      bool   // global default for suppressing cron start notifications
-	defaultSessionMode string // global default session mode; "" = reuse, "new_per_run" = fresh session each run
+	defaultSessionMode string // global default session mode; "reuse" = share active session, "new_per_run" = fresh session each run
 
 	// runLoop plumbing. wakeUp carries a "schedule changed, re-evaluate"
 	// signal (buffered 1). stop ends the loop. done closes when the loop
@@ -460,9 +474,10 @@ type CronScheduler struct {
 
 func NewCronScheduler(store *CronStore) *CronScheduler {
 	return &CronScheduler{
-		store:   store,
-		engines: make(map[string]*Engine),
-		entries: make(map[string]*cronEntry),
+		store:              store,
+		engines:            make(map[string]*Engine),
+		entries:            make(map[string]*cronEntry),
+		defaultSessionMode: defaultScheduledSessionMode,
 	}
 }
 
@@ -744,7 +759,7 @@ func (cs *CronScheduler) UpdateJob(id string, field string, value any) error {
 	if field == "session_mode" {
 		if v, ok := value.(string); ok && v != "" {
 			mode := NormalizeCronSessionMode(v)
-			if mode != "" && mode != "new_per_run" {
+			if mode != "" && mode != "reuse" && mode != "new_per_run" {
 				return fmt.Errorf("invalid session_mode %q (want reuse, new_per_run, or new-per-run)", v)
 			}
 		}
