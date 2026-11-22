@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -137,6 +138,8 @@ type replyContext struct {
 
 type Platform struct {
 	mu                         sync.RWMutex
+	localizer                  atomic.Pointer[core.Localizer]
+	askqLiveCheck              atomic.Pointer[core.AskQuestionLiveCheck]
 	platformName               string
 	domain                     string
 	appID                      string
@@ -1150,7 +1153,7 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 	// dispatches into the requester's session and is consumed as their
 	// answer/approval.
 	if strings.HasPrefix(actionVal, "askq:") || strings.HasPrefix(actionVal, "perm:") {
-		if rejected := rejectNonRequester(sessionKey, userID); rejected != nil {
+		if rejected := rejectNonRequester(sessionKey, userID, p.localize(core.MsgCardRequesterOnly, requesterOnlyFallback)); rejected != nil {
 			return rejected, nil
 		}
 	}
@@ -1199,6 +1202,17 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 
 	// askq: — AskUserQuestion option selected, forward as user message
 	if strings.HasPrefix(actionVal, "askq:") {
+		// A click on a question that was already answered (e.g. by text) is
+		// dropped by the engine; do not render it as the chosen answer (#2302).
+		if c := p.askqLiveCheck.Load(); c != nil && *c != nil && !(*c)(sessionKey, actionVal) {
+			slog.Info(p.tag()+": stale ask-question click, card left unchanged", "session", sessionKey, "action", actionVal)
+			return &callback.CardActionTriggerResponse{
+				Toast: &callback.Toast{
+					Type:    "info",
+					Content: p.localize(core.MsgAskQuestionStale, askqStaleFallback),
+				},
+			}, nil
+		}
 		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
 		p.dispatchCardActionMessage(chatID, &core.Message{
 			SessionKey: sessionKey,
@@ -4711,7 +4725,7 @@ func requesterFromSessionKey(sessionKey string) (string, bool) {
 // rejectNonRequester returns a toast response when sessionKey belongs to a
 // single requester who is not the current clicker, and nil when the click is
 // allowed through (requester's own click, or a shared session).
-func rejectNonRequester(sessionKey, clickerOpenID string) *callback.CardActionTriggerResponse {
+func rejectNonRequester(sessionKey, clickerOpenID, toast string) *callback.CardActionTriggerResponse {
 	owner, ok := requesterFromSessionKey(sessionKey)
 	if !ok || owner == clickerOpenID {
 		return nil
@@ -4720,9 +4734,36 @@ func rejectNonRequester(sessionKey, clickerOpenID string) *callback.CardActionTr
 	return &callback.CardActionTriggerResponse{
 		Toast: &callback.Toast{
 			Type:    "info",
-			Content: "此卡片仅提问者本人可操作 / Only the requester can operate this card",
+			Content: toast,
 		},
 	}
+}
+
+// requesterOnlyFallback is used until the engine has provided a localizer.
+const requesterOnlyFallback = "此卡片仅提问者本人可操作 / Only the requester can operate this card"
+
+// askqStaleFallback is used until the engine has provided a localizer.
+const askqStaleFallback = "这个问题已经回答过了或已失效 / That question was already answered or is no longer active"
+
+// SetAskQuestionLiveCheck implements core.AskQuestionStateAware.
+func (p *Platform) SetAskQuestionLiveCheck(c core.AskQuestionLiveCheck) {
+	p.askqLiveCheck.Store(&c)
+}
+
+// SetLocalizer implements core.LocalizerAware.
+func (p *Platform) SetLocalizer(l core.Localizer) {
+	p.localizer.Store(&l)
+}
+
+// localize returns key in the engine's language, or fallback when no
+// localizer has been set.
+func (p *Platform) localize(key core.MsgKey, fallback string) string {
+	if l := p.localizer.Load(); l != nil && *l != nil {
+		if text := (*l)(key); text != "" {
+			return text
+		}
+	}
+	return fallback
 }
 
 func (p *Platform) shouldReplyInThread(rc replyContext) bool {

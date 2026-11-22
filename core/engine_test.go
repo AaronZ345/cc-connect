@@ -7522,6 +7522,41 @@ func TestHandlePendingPermission_TimerFallback(t *testing.T) {
 	}
 }
 
+// TestAskQuestionCallbackLive_ScheduledFallback covers the live check that
+// platforms call before rendering an AskUserQuestion answer. Scheduled jobs
+// store their question under a composite key, so a click arriving with the
+// plain sessionKey must find both cron and timer states instead of being
+// reported stale.
+func TestAskQuestionCallbackLive_ScheduledFallback(t *testing.T) {
+	for _, scope := range []string{"#cron:", "#timer:"} {
+		t.Run(scope, func(t *testing.T) {
+			e := newTestEngine()
+			p := &stubPlatformEngine{n: "test"}
+			key := "test:chat:user1" + scope + "sid"
+
+			e.interactiveMu.Lock()
+			e.interactiveStates[key] = &interactiveState{
+				platform: p,
+				replyCtx: "ctx",
+				pending: &pendingPermission{
+					RequestID:       "req-q",
+					Questions:       testQuestions(),
+					CurrentQuestion: 0,
+					Resolved:        make(chan struct{}),
+				},
+			}
+			e.interactiveMu.Unlock()
+
+			if !e.askQuestionCallbackLive("test:chat:user1", "askq:0:1") {
+				t.Fatalf("click on waiting question under %q reported stale", key)
+			}
+			if e.askQuestionCallbackLive("test:chat:user1", "askq:1:1") {
+				t.Fatalf("click on another question's card under %q reported live", key)
+			}
+		})
+	}
+}
+
 // ──────────────────────────────────────────────────────────────
 // Session routing / cleanup CAS tests
 // ──────────────────────────────────────────────────────────────
