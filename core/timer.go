@@ -407,7 +407,7 @@ func (ts *TimerScheduler) executeJob(jobID string) {
 		return
 	}
 
-	slog.Info("timer: executing job", "id", jobID, "project", job.Project, "prompt", truncateStr(job.Prompt, 60))
+	slog.Info("timer: executing job", "id", jobID, "project", job.Project, "prompt_len", len(job.Prompt))
 
 	done := make(chan error, 1)
 	go func() {
