@@ -724,19 +724,19 @@ func (a *stubDeleteAgent) DeleteSession(_ context.Context, sessionID string) err
 	return nil
 }
 
-// waitDeleteModePhase polls the delete-mode state for the given session key
-// until it reaches the target phase or the timeout expires.
-func waitDeleteModePhase(t *testing.T, e *Engine, sessionKey, targetPhase string) {
+// waitDeleteModeResult polls until the asynchronous delete operation updates
+// both its state and the user-visible card.
+func waitDeleteModeResult(t *testing.T, e *Engine, p *stubCardPlatform, sessionKey string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		dm := e.getDeleteModeState(sessionKey)
-		if dm != nil && dm.phase == targetPhase {
+		if dm != nil && dm.phase == "result" && len(p.getRefreshedCards()) > 0 {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for delete mode phase %q", targetPhase)
+	t.Fatal("timed out waiting for delete mode result card")
 }
 
 type stubProviderAgent struct {
@@ -4535,7 +4535,7 @@ func TestDeleteMode_ConfirmAndSubmitDeletesSelectedSessions(t *testing.T) {
 	}
 	// Submit is now async; the returned card is a "deleting" indicator.
 	// Wait for the background goroutine to complete and push the result card.
-	waitDeleteModePhase(t, e, msg.SessionKey, "result")
+	waitDeleteModeResult(t, e, p, msg.SessionKey)
 	if got, want := strings.Join(agent.deleted, ","), "session-1,session-3"; got != want {
 		t.Fatalf("deleted = %q, want %q", got, want)
 	}
@@ -4573,7 +4573,7 @@ func TestDeleteMode_SubmitReportsMissingSelectedSessions(t *testing.T) {
 		t.Fatal("expected deleting card after submit")
 	}
 	// Wait for async deletion to complete.
-	waitDeleteModePhase(t, e, msg.SessionKey, "result")
+	waitDeleteModeResult(t, e, p, msg.SessionKey)
 	refreshed := p.getRefreshedCards()
 	if len(refreshed) == 0 {
 		t.Fatal("expected refreshed result card via RefreshCard")
@@ -4675,7 +4675,7 @@ func TestDeleteMode_SubmitBlocksActiveSession(t *testing.T) {
 		t.Fatal("expected deleting card")
 	}
 	// Wait for async deletion to complete.
-	waitDeleteModePhase(t, e, msg.SessionKey, "result")
+	waitDeleteModeResult(t, e, p, msg.SessionKey)
 	if len(agent.deleted) != 0 {
 		t.Fatalf("deleted = %v, want none", agent.deleted)
 	}
@@ -4751,7 +4751,7 @@ func TestDeleteMode_FormSubmitShowsConfirmThenDeletes(t *testing.T) {
 		t.Fatal("expected deleting card after submit")
 	}
 	// Wait for async deletion to complete.
-	waitDeleteModePhase(t, e, msg.SessionKey, "result")
+	waitDeleteModeResult(t, e, p, msg.SessionKey)
 	if got, want := strings.Join(agent.deleted, ","), "session-1,session-3"; got != want {
 		t.Fatalf("deleted = %q, want %q", got, want)
 	}
@@ -6495,7 +6495,7 @@ func TestCmdUsage_Success(t *testing.T) {
 	}
 	got := p.sent[0]
 	for _, want := range []string{
-		"Account: dev@example.com (team)",
+		"Account: d*** (team)",
 		"5h limit",
 		"Remaining: 77%",
 		"Resets: 1h 51m",
@@ -6513,7 +6513,7 @@ func TestCmdUsage_Success(t *testing.T) {
 	}
 }
 
-func TestCmdUsage_UsesCardOnCardPlatform(t *testing.T) {
+func TestCmdUsage_CardOmitsEmailRejectedByFeishuAudit(t *testing.T) {
 	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
 	agent := &stubUsageAgent{
 		report: &UsageReport{
@@ -6545,7 +6545,7 @@ func TestCmdUsage_UsesCardOnCardPlatform(t *testing.T) {
 	}
 	text := p.repliedCards[0].RenderText()
 	for _, want := range []string{
-		"账号：dev@example.com (team)",
+		"账号：d*** (team)",
 		"5小时限额",
 		"剩余：77%",
 		"重置：1小时 51分钟",
@@ -6556,6 +6556,9 @@ func TestCmdUsage_UsesCardOnCardPlatform(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("card text = %q, want substring %q", text, want)
 		}
+	}
+	if strings.Contains(text, "@") {
+		t.Fatalf("card text contains an email address: %q", text)
 	}
 }
 
@@ -6588,7 +6591,7 @@ func TestCmdUsage_LocalizedChinese(t *testing.T) {
 	}
 	got := p.sent[0]
 	for _, want := range []string{
-		"账号：dev@example.com (team)",
+		"账号：d*** (team)",
 		"5小时限额",
 		"剩余：77%",
 		"重置：1小时 51分钟",
@@ -7878,6 +7881,75 @@ func TestHandlePendingPermission_CronFallback(t *testing.T) {
 	}
 	if rec.lastResult.Behavior != "allow" {
 		t.Fatalf("RespondPermission behavior = %q, want %q", rec.lastResult.Behavior, "allow")
+	}
+}
+
+// TestHandlePendingPermission_TimerFallback guards the same composite-key
+// lookup for timer jobs, which now default to a fresh session per run and
+// therefore surface their permission prompts under "key#timer:sid".
+func TestHandlePendingPermission_TimerFallback(t *testing.T) {
+	e := newTestEngine()
+	p := &stubPlatformEngine{n: "test"}
+	rec := &recordingAgentSession{}
+
+	timerKey := "test:chat:user1#timer:sid456"
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[timerKey] = &interactiveState{
+		agentSession: rec,
+		platform:     p,
+		replyCtx:     "ctx",
+		pending: &pendingPermission{
+			RequestID: "req-timer",
+			ToolInput: map[string]any{"path": "/tmp/y"},
+			Resolved:  make(chan struct{}),
+		},
+	}
+	e.interactiveMu.Unlock()
+
+	msg := &Message{SessionKey: "test:chat:user1", ReplyCtx: "ctx"}
+
+	if !e.handlePendingPermission(p, msg, "allow", "") {
+		t.Fatal("expected pending permission to be handled via timer fallback")
+	}
+	if rec.calls != 1 || rec.lastID != "req-timer" || rec.lastResult.Behavior != "allow" {
+		t.Fatalf("RespondPermission calls=%d id=%q behavior=%q, want 1/%q/allow",
+			rec.calls, rec.lastID, rec.lastResult.Behavior, "req-timer")
+	}
+}
+
+// TestAskQuestionCallbackLive_ScheduledFallback covers the live check that
+// platforms call before rendering an AskUserQuestion answer. Scheduled jobs
+// store their question under a composite key, so a click arriving with the
+// plain sessionKey must find both cron and timer states instead of being
+// reported stale.
+func TestAskQuestionCallbackLive_ScheduledFallback(t *testing.T) {
+	for _, scope := range []string{"#cron:", "#timer:"} {
+		t.Run(scope, func(t *testing.T) {
+			e := newTestEngine()
+			p := &stubPlatformEngine{n: "test"}
+			key := "test:chat:user1" + scope + "sid"
+
+			e.interactiveMu.Lock()
+			e.interactiveStates[key] = &interactiveState{
+				platform: p,
+				replyCtx: "ctx",
+				pending: &pendingPermission{
+					RequestID:       "req-q",
+					Questions:       testQuestions(),
+					CurrentQuestion: 0,
+					Resolved:        make(chan struct{}),
+				},
+			}
+			e.interactiveMu.Unlock()
+
+			if !e.askQuestionCallbackLive("test:chat:user1", "askq:0:1") {
+				t.Fatalf("click on waiting question under %q reported stale", key)
+			}
+			if e.askQuestionCallbackLive("test:chat:user1", "askq:1:1") {
+				t.Fatalf("click on another question's card under %q reported live", key)
+			}
+		})
 	}
 }
 
@@ -11911,6 +11983,172 @@ func TestHandleMessageRecallStopsCurrentMessageSilently(t *testing.T) {
 	}
 }
 
+func TestHandleMessageRecallPreservesLaterQueueWhenAgentChannelCloses(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	oldSession := newQueuingSession("old-session")
+	replacementSession := newResultAgentSession("reply after recall")
+
+	var startMu sync.Mutex
+	startCount := 0
+	agent := &controllableAgent{startSessionFn: func(_ context.Context, _ string) (AgentSession, error) {
+		startMu.Lock()
+		defer startMu.Unlock()
+		startCount++
+		if startCount == 1 {
+			return oldSession, nil
+		}
+		return replacementSession, nil
+	}}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	key := "test:recall-queue"
+
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: "test", MessageID: "msg-first",
+		UserID: "user", UserName: "user", Content: "first", ReplyCtx: "ctx-first",
+	})
+	waitForSendCount := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			oldSession.sendMu.Lock()
+			got := len(oldSession.sendCalls)
+			oldSession.sendMu.Unlock()
+			if got >= want {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatalf("old session send count did not reach %d", want)
+	}
+	waitForSendCount(1)
+
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: "test", MessageID: "msg-recalled",
+		UserID: "user", UserName: "user", Content: "recalled", ReplyCtx: "ctx-recalled",
+	})
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: "test", MessageID: "msg-later",
+		UserID: "user", UserName: "user", Content: "later message", ReplyCtx: "ctx-later",
+	})
+
+	oldSession.events <- Event{Type: EventResult, Content: "first reply", Done: true}
+	waitForSendCount(2)
+
+	e.ReceiveMessage(p, &Message{Platform: "test", MessageID: "msg-recalled", Recalled: true})
+	sent := waitForPlatformSend(p, 4, 3*time.Second)
+	foundReply := false
+	for _, message := range sent {
+		if message == "reply after recall" {
+			foundReply = true
+			break
+		}
+	}
+	if !foundReply {
+		t.Fatalf("sent = %v, want reply for later queued message after recall", sent)
+	}
+	if len(replacementSession.sentPrompts) != 1 || !strings.Contains(replacementSession.sentPrompts[0], "later message") {
+		t.Fatalf("replacement prompts = %v, want later queued message", replacementSession.sentPrompts)
+	}
+}
+
+// TestResumePendingAfterStoppedTurnReacquiresLock covers the recall handoff:
+// the stopped turn force-unlocked and bumped the generation, so the resume
+// path must take a fresh lock before running preserved work. Without it the
+// resumed turn runs unlocked while new messages start competing turns.
+func TestResumePendingAfterStoppedTurnReacquiresLock(t *testing.T) {
+	e := newTestEngine()
+	key := "test:recall-lock"
+	session := &Session{ID: "sid"}
+	staleGen, ok := session.TryLock()
+	if !ok {
+		t.Fatal("expected to take the initial lock")
+	}
+	if !session.ForceUnlock() {
+		t.Fatal("expected ForceUnlock to release the lock")
+	}
+
+	state := &interactiveState{
+		stopped: true,
+		pendingMessages: []queuedMessage{{
+			messageID: "msg-later",
+			platform:  &stubPlatformEngine{n: "test"},
+			replyCtx:  "ctx-later",
+			content:   "later",
+		}},
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	agentSession := newResultAgentSession("recovered")
+	agent := &controllableAgent{nextSession: agentSession}
+	sessions := NewSessionManager("")
+	sessions.sessions[session.ID] = session
+	sessions.activeSession["k"] = session.ID
+
+	_ = staleGen
+	if !e.resumePendingAfterStoppedTurn(state, session, sessions, key, agent, "", "", staleGen) {
+		t.Fatal("expected the preserved queue to be resumed")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(agentSession.sentPrompts) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(agentSession.sentPrompts) != 1 {
+		t.Fatalf("resumed prompts = %v, want one preserved turn", agentSession.sentPrompts)
+	}
+	if session.Busy() {
+		t.Fatal("expected the resumed turn to release the reacquired lock")
+	}
+}
+
+// TestResumePendingAfterStoppedTurnHandsOffWhenBusy ensures a newer owner of
+// the session lock keeps its queue instead of having it stolen by the stopped
+// turn's goroutine.
+func TestResumePendingAfterStoppedTurnHandsOffWhenBusy(t *testing.T) {
+	e := newTestEngine()
+	key := "test:recall-handoff"
+	session := &Session{ID: "sid"}
+	if gen, ok := session.TryLock(); ok {
+		session.ForceUnlock()
+		_ = gen
+	}
+
+	state := &interactiveState{
+		stopped: true,
+		pendingMessages: []queuedMessage{{
+			messageID: "msg-preserved",
+			platform:  &stubPlatformEngine{n: "test"},
+			replyCtx:  "ctx",
+			content:   "preserved",
+		}},
+	}
+	currentOwner := &interactiveState{}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = currentOwner
+	e.interactiveMu.Unlock()
+
+	// A newer turn holds the lock.
+	if _, ok := session.TryLock(); !ok {
+		t.Fatal("expected the newer turn to own the lock")
+	}
+
+	if !e.resumePendingAfterStoppedTurn(state, session, NewSessionManager(""), key,
+		&controllableAgent{nextSession: newResultAgentSession("x")}, "", "", 0) {
+		t.Fatal("expected handoff to report the turn as completed")
+	}
+
+	currentOwner.mu.Lock()
+	queued := append([]queuedMessage(nil), currentOwner.pendingMessages...)
+	currentOwner.mu.Unlock()
+	if len(queued) != 1 || queued[0].messageID != "msg-preserved" {
+		t.Fatalf("current owner queue = %+v, want the preserved message", queued)
+	}
+	if !session.Busy() {
+		t.Fatal("stopped turn must not release the newer owner's lock")
+	}
+}
+
 func TestHandleMessageRecallRemovesQueuedMessageSilently(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
@@ -14883,6 +15121,7 @@ func TestIssue1959_CronResultIdentifiesJob(t *testing.T) {
 		SessionKey:  "discord:channel-1:user-1",
 		Prompt:      "summarize activity",
 		Description: "Daily summary",
+		SessionMode: "reuse",
 	}
 	if err := store.Add(job); err != nil {
 		t.Fatalf("store.Add() error = %v", err)
