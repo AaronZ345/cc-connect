@@ -163,16 +163,17 @@ type Platform struct {
 	threadIsolation            bool
 	groupChatHistoryShare      bool
 	// noReplyToTrigger: when true, send via Create instead of Im.Message.Reply (no quote to the user's message).
-	noReplyToTrigger bool
-	resolveMentions  bool
-	client           *lark.Client
-	replayClient     *lark.Client
-	replayClientMu   sync.Mutex
-	handler          core.MessageHandler
-	cardNavHandler   core.CardNavigationHandler
-	cancel           context.CancelFunc
-	dedup            *core.MessageDedup
-	botOpenID        string
+	noReplyToTrigger        bool
+	resolveMentions         bool
+	client                  *lark.Client
+	replayClient            *lark.Client
+	replayClientMu          sync.Mutex
+	handler                 core.MessageHandler
+	cardNavHandler          core.CardNavigationHandler
+	userAwareCardNavHandler core.UserAwareCardNavigationHandler
+	cancel                  context.CancelFunc
+	dedup                   *core.MessageDedup
+	botOpenID               string
 	// groupFilterDegraded is true when bot open_id discovery failed at startup
 	// (e.g. transient network/DNS/proxy outage). When true, group chat mention
 	// filtering fails closed (silently drops group messages without @bot) instead
@@ -368,7 +369,17 @@ type richCardImageUpload struct {
 type feishuRequestFunc func(client *lark.Client, options ...larkcore.RequestOptionFunc) error
 
 func (p *Platform) SetCardNavigationHandler(h core.CardNavigationHandler) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.cardNavHandler = h
+	p.userAwareCardNavHandler = nil
+}
+
+func (p *Platform) SetUserAwareCardNavigationHandler(h core.UserAwareCardNavigationHandler) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.userAwareCardNavHandler = h
+	p.cardNavHandler = nil
 }
 
 func New(opts map[string]any) (core.Platform, error) {
@@ -1108,10 +1119,16 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 				},
 			}, nil
 		}
-		if p.cardNavHandler != nil {
+		p.mu.RLock()
+		nav, userAwareNav := p.cardNavHandler, p.userAwareCardNavHandler
+		p.mu.RUnlock()
+		if h := userAwareNav; h != nil {
+			nav = func(action, key string) *core.Card { return h(action, key, userID) }
+		}
+		if nav != nil {
 			done := make(chan *core.Card, 1)
 			go func() {
-				done <- p.cardNavHandler(actionVal, sessionKey)
+				done <- nav(actionVal, sessionKey)
 			}()
 
 			select {
@@ -2793,17 +2810,33 @@ func (p *Platform) fetchChatMembers(ctx context.Context, chatID string) (map[str
 	if err != nil {
 		return nil, fmt.Errorf("%s: fetch tenant token for chat members: %w", p.tag(), err)
 	}
-	iter, err := p.client.Im.ChatMembers.GetByIterator(timeoutCtx, req, larkcore.WithTenantAccessToken(token))
-	if err != nil {
-		return nil, fmt.Errorf("%s: list chat members: %w", p.tag(), err)
-	}
-	for {
-		hasMore, member, err := iter.Next()
+	// Page manually instead of using GetByIterator: the SDK iterator ignores
+	// has_more and keeps refetching page 1 when Feishu returns an empty (not
+	// absent) page_token on the last page, which loops until the timeout.
+	pageToken := ""
+	for page := 0; page < 50; page++ {
+		if pageToken != "" {
+			req = larkim.NewGetChatMembersReqBuilder().
+				ChatId(chatID).
+				MemberIdType("open_id").
+				PageSize(100).
+				PageToken(pageToken).
+				Build()
+		}
+		resp, err := p.client.Im.ChatMembers.Get(timeoutCtx, req, larkcore.WithTenantAccessToken(token))
 		if err != nil {
-			slog.Debug(p.tag()+": fetch chat members page error", "chat_id", chatID, "error", err)
+			return nil, fmt.Errorf("%s: list chat members: %w", p.tag(), err)
+		}
+		if !resp.Success() {
+			return nil, fmt.Errorf("%s: list chat members code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
+		}
+		if resp.Data == nil {
 			break
 		}
-		if member != nil && member.Name != nil && member.MemberId != nil {
+		for _, member := range resp.Data.Items {
+			if member == nil || member.Name == nil || member.MemberId == nil {
+				continue
+			}
 			name := *member.Name
 			if _, exists := members[name]; !exists {
 				members[name] = *member.MemberId
@@ -2811,9 +2844,10 @@ func (p *Platform) fetchChatMembers(ctx context.Context, chatID string) (map[str
 				members[name] = ""
 			}
 		}
-		if !hasMore {
+		if resp.Data.HasMore == nil || !*resp.Data.HasMore || resp.Data.PageToken == nil || *resp.Data.PageToken == "" {
 			break
 		}
+		pageToken = *resp.Data.PageToken
 	}
 	return members, nil
 }

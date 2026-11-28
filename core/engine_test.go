@@ -6872,19 +6872,112 @@ func TestHandleCardNav_DirSelectSwitchesWorkDir(t *testing.T) {
 	dataDir := t.TempDir()
 	agent := &stubWorkDirAgent{workDir: d3}
 	e := NewEngine("test", agent, []Platform{&stubPlatformEngine{n: "test"}}, dataDir, LangEnglish)
+	e.SetAdminFrom("user1")
 	e.SetDirHistory(NewDirHistory(dataDir))
 	e.dirHistory.Add("test", d1)
 	e.dirHistory.Add("test", d2)
 	e.dirHistory.Add("test", d3)
 
 	sk := "test:user1"
-	_ = e.handleCardNav("act:/dir select 2", sk)
+	_ = e.handleCardNavForUser("act:/dir select 2", sk, "user1")
 	if agent.workDir != d2 {
 		t.Fatalf("workDir = %q, want %q", agent.workDir, d2)
 	}
-	card := e.handleCardNav("nav:/dir 1", sk)
+	card := e.handleCardNavForUser("nav:/dir 1", sk, "user1")
 	if card == nil {
 		t.Fatal("expected dir card after nav")
+	}
+}
+
+func TestHandleCardNav_DisabledProviderIsRefused(t *testing.T) {
+	agent := &stubProviderAgent{
+		providers: []ProviderConfig{{Name: "a"}, {Name: "b"}},
+		active:    "a",
+	}
+	e := NewEngine("test", agent, []Platform{&stubPlatformEngine{n: "test"}}, "", LangEnglish)
+	e.SetDisabledCommands([]string{"provider"})
+	sk := "test:user1"
+
+	for _, action := range []string{"nav:/provider", "act:/provider b", "act:/provider/add-other", "act:/provider clear"} {
+		card := e.handleCardNav(action, sk)
+		if card == nil || !strings.Contains(card.RenderText(), "Command `/provider` is disabled") {
+			t.Fatalf("%s: card = %v, want disabled notice", action, card)
+		}
+	}
+	if agent.active != "a" {
+		t.Fatalf("active provider = %q, want a", agent.active)
+	}
+}
+
+func TestHandleCardNav_DisabledDirAndDeleteAreRefused(t *testing.T) {
+	temp := t.TempDir()
+	d1 := filepath.Join(temp, "a")
+	d2 := filepath.Join(temp, "b")
+	for _, d := range []string{d1, d2} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+	dataDir := t.TempDir()
+	agent := &stubWorkDirAgent{workDir: d2}
+	e := NewEngine("test", agent, []Platform{&stubPlatformEngine{n: "test"}}, dataDir, LangEnglish)
+	e.SetDirHistory(NewDirHistory(dataDir))
+	e.dirHistory.Add("test", d1)
+	e.dirHistory.Add("test", d2)
+	e.SetDisabledCommands([]string{"dir", "delete"})
+	// The clicker is an admin, so only the disabled-command gate can refuse
+	// /dir here; the privilege and missing-actor gates cannot fire.
+	e.SetAdminFrom("user1")
+	sk := "test:user1"
+
+	card := e.handleCardNavForUser("act:/dir select 2", sk, "user1")
+	if card == nil || !strings.Contains(card.RenderText(), "Command `/dir` is disabled") {
+		t.Fatalf("dir card = %v, want disabled notice", card)
+	}
+	if agent.workDir != d2 {
+		t.Fatalf("workDir = %q, want unchanged %q", agent.workDir, d2)
+	}
+	card = e.handleCardNav("act:/delete-mode submit", sk)
+	if card == nil || !strings.Contains(card.RenderText(), "Command `/delete` is disabled") {
+		t.Fatalf("delete-mode card = %v, want disabled notice", card)
+	}
+}
+
+func TestHandleCardNav_RoleDisabledCommandUsesExplicitActor(t *testing.T) {
+	agent := &stubProviderAgent{providers: []ProviderConfig{{Name: "a"}, {Name: "b"}}, active: "a"}
+	e := NewEngine("test", agent, []Platform{&stubPlatformEngine{n: "test"}}, "", LangEnglish)
+	urm := NewUserRoleManager()
+	urm.Configure("member", []RoleInput{
+		{Name: "admin", UserIDs: []string{"u_admin"}},
+		{Name: "member", UserIDs: []string{"*"}, DisabledCommands: []string{"provider"}},
+	})
+	e.SetUserRoles(urm)
+
+	_ = e.handleCardNavForUser("act:/provider b", "test:chat1:u_other", "u_other")
+	if agent.active != "a" {
+		t.Fatalf("member switched provider to %q", agent.active)
+	}
+	_ = e.handleCardNavForUser("act:/provider b", "test:chat1:u_admin", "u_admin")
+	if agent.active != "b" {
+		t.Fatalf("admin provider = %q, want b", agent.active)
+	}
+}
+
+func TestRenderHelpCard_HidesDisabledCommands(t *testing.T) {
+	e := NewEngine("test", &stubAgent{}, []Platform{&stubPlatformEngine{n: "test"}}, "", LangEnglish)
+	e.SetDisabledCommands([]string{"delete", "provider", "memory", "upgrade", "dir"})
+
+	for _, group := range []string{"session", "agent", "tools", "system"} {
+		card := e.handleCardNav("nav:/help "+group, "test:user1")
+		text := card.RenderText()
+		for _, cmd := range []string{"/delete", "/provider", "/memory", "/upgrade", "/dir"} {
+			if strings.Contains(text, "**"+cmd+"**") {
+				t.Fatalf("help %s = %q, should not list %s", group, text, cmd)
+			}
+		}
+	}
+	if _, ok := findCardAction(e.handleCardNav("nav:/help agent", "test:user1"), "nav:/model"); !ok {
+		t.Fatal("enabled commands should stay on the help card")
 	}
 }
 
@@ -12498,12 +12591,18 @@ func TestEventIdleTimeout_CleansUpSession(t *testing.T) {
 		agentSession: sess,
 		platform:     p,
 		replyCtx:     "ctx",
+		pendingMessages: []queuedMessage{{
+			platform: p,
+			replyCtx: "queued-ctx",
+			content:  "queued message",
+		}},
 	}
 	e.interactiveMu.Lock()
 	e.interactiveStates[key] = state
 	e.interactiveMu.Unlock()
 
 	session := e.sessions.GetOrCreateActive(key)
+	session.SetAgentSessionID("persisted-agent-session", "test")
 	session.TryLock()
 
 	done := make(chan struct{})
@@ -12520,13 +12619,26 @@ func TestEventIdleTimeout_CleansUpSession(t *testing.T) {
 
 	sent := p.getSent()
 	foundTimeout := false
+	foundQueuedNotice := false
 	for _, s := range sent {
-		if strings.Contains(s, "timed out") {
+		if strings.Contains(s, "run timed out after") && strings.Contains(s, "send another message to continue") {
 			foundTimeout = true
+		}
+		if strings.Contains(s, "queued message was not processed") && strings.Contains(s, "send this message again") {
+			foundQueuedNotice = true
+		}
+		if strings.Contains(s, "session reset") {
+			t.Fatalf("misleading reset message sent: %q", s)
 		}
 	}
 	if !foundTimeout {
 		t.Fatalf("expected timeout error message, got %v", sent)
+	}
+	if !foundQueuedNotice {
+		t.Fatalf("expected queued-message timeout notice, got %v", sent)
+	}
+	if got := session.GetAgentSessionID(); got != "persisted-agent-session" {
+		t.Fatalf("persistent agent session ID changed after run timeout: %q", got)
 	}
 }
 

@@ -210,6 +210,8 @@ const (
 	MsgPreviousProcessing        MsgKey = "previous_processing"
 	MsgQueueFull                 MsgKey = "queue_full"
 	MsgMessageQueued             MsgKey = "message_queued"
+	MsgAgentIdleTimeout          MsgKey = "agent_idle_timeout"
+	MsgQueuedMessageTimedOut     MsgKey = "queued_message_timed_out"
 	MsgNoToolsAllowed            MsgKey = "no_tools_allowed"
 	MsgCurrentTools              MsgKey = "current_tools"
 	MsgCurrentSession            MsgKey = "current_session"
@@ -560,6 +562,7 @@ const (
 	MsgBannedWordBlocked MsgKey = "banned_word_blocked"
 	MsgCommandDisabled   MsgKey = "command_disabled"
 	MsgAdminRequired     MsgKey = "admin_required"
+	MsgCardActorRequired MsgKey = "card_actor_required"
 	MsgRateLimited       MsgKey = "rate_limited"
 	MsgPsSent            MsgKey = "ps_sent"
 	MsgPsSendFailed      MsgKey = "ps_send_failed"
@@ -817,6 +820,20 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "📬 訊息已收到，將在目前任務完成後處理。",
 		LangJapanese:           "📬 メッセージを受信しました。現在のタスク完了後に処理します。",
 		LangSpanish:            "📬 Mensaje recibido — se procesará después de que termine la tarea actual.",
+	},
+	MsgAgentIdleTimeout: {
+		LangEnglish:            "⏳ This run timed out after %s without new activity. Conversation history was preserved; send another message to continue.",
+		LangChinese:            "⏳ 本轮运行连续 %s 没有新活动，已超时终止。会话历史仍然保留，发送下一条消息即可继续。",
+		LangTraditionalChinese: "⏳ 本輪執行連續 %s 沒有新活動，已逾時終止。對話歷史仍然保留，傳送下一則訊息即可繼續。",
+		LangJapanese:           "⏳ この実行は %s の間新しい動きがなかったためタイムアウトしました。会話履歴は保持されています。次のメッセージを送信すると続行できます。",
+		LangSpanish:            "⏳ Esta ejecución agotó el tiempo tras %s sin actividad nueva. El historial de la conversación se conservó; envía otro mensaje para continuar.",
+	},
+	MsgQueuedMessageTimedOut: {
+		LangEnglish:            "⚠️ This queued message was not processed because the previous run timed out. Conversation history was preserved; please send this message again.",
+		LangChinese:            "⚠️ 上一轮运行超时，这条排队消息未被处理。会话历史仍然保留，请重新发送这条消息。",
+		LangTraditionalChinese: "⚠️ 上一輪執行逾時，這則排隊訊息未被處理。對話歷史仍然保留，請重新傳送這則訊息。",
+		LangJapanese:           "⚠️ 前の実行がタイムアウトしたため、この待機中のメッセージは処理されませんでした。会話履歴は保持されています。このメッセージをもう一度送信してください。",
+		LangSpanish:            "⚠️ Este mensaje en cola no se procesó porque la ejecución anterior agotó el tiempo. El historial de la conversación se conservó; vuelve a enviar este mensaje.",
 	},
 	MsgQueueFull: {
 		LangEnglish:            "📬 Message queue is full (%d pending). Please wait for current tasks to complete.",
@@ -3495,6 +3512,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "🚫 命令 `%s` 在當前專案中已被停用。",
 		LangJapanese:           "🚫 コマンド `%s` はこのプロジェクトで無効化されています。",
 		LangSpanish:            "🚫 El comando `%s` está deshabilitado para este proyecto.",
+	},
+	MsgCardActorRequired: {
+		LangEnglish:            "🔒 Cannot verify who clicked this card. Please use the text command instead.",
+		LangChinese:            "🔒 无法确认此卡片的点击者身份，请改用文本命令。",
+		LangTraditionalChinese: "🔒 無法確認此卡片的點擊者身分，請改用文字命令。",
+		LangJapanese:           "🔒 このカードをクリックしたユーザーを確認できません。テキストコマンドを使用してください。",
+		LangSpanish:            "🔒 No se puede verificar quién pulsó esta tarjeta. Usa el comando de texto.",
 	},
 	MsgAdminRequired: {
 		LangEnglish:            "🔒 Command `%s` requires admin privilege. Set `admin_from` in config to authorize users.",
